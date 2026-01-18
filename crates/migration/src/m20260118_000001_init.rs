@@ -1,0 +1,630 @@
+use sea_orm_migration::prelude::*;
+use sea_orm_migration::sea_query::StringLen;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(Listeners::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(Listeners::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Listeners::Name).string().not_null())
+                    .col(ColumnDef::new(Listeners::Port).integer().not_null())
+                    .col(ColumnDef::new(Listeners::Protocol).string().not_null())
+                    .col(ColumnDef::new(Listeners::TlsPolicyId).uuid())
+                    .col(
+                        ColumnDef::new(Listeners::Enabled)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(
+                        ColumnDef::new(Listeners::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        ColumnDef::new(Listeners::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(UpstreamPools::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(UpstreamPools::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(UpstreamPools::Name).string().not_null())
+                    .col(ColumnDef::new(UpstreamPools::Policy).string().not_null())
+                    .col(ColumnDef::new(UpstreamPools::HealthCheck).json_binary())
+                    .col(
+                        ColumnDef::new(UpstreamPools::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        ColumnDef::new(UpstreamPools::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(UpstreamTargets::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(UpstreamTargets::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(UpstreamTargets::PoolId).uuid().not_null())
+                    .col(ColumnDef::new(UpstreamTargets::Address).string().not_null())
+                    .col(
+                        ColumnDef::new(UpstreamTargets::Weight)
+                            .integer()
+                            .not_null()
+                            .default(1),
+                    )
+                    .col(
+                        ColumnDef::new(UpstreamTargets::Enabled)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(
+                        ColumnDef::new(UpstreamTargets::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        ColumnDef::new(UpstreamTargets::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(UpstreamTargets::Table, UpstreamTargets::PoolId)
+                            .to(UpstreamPools::Table, UpstreamPools::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(Routes::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(Routes::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Routes::ListenerId).uuid().not_null())
+                    .col(ColumnDef::new(Routes::Type).string().not_null())
+                    .col(ColumnDef::new(Routes::MatchExpr).json_binary().not_null())
+                    .col(ColumnDef::new(Routes::Priority).integer().not_null())
+                    .col(ColumnDef::new(Routes::UpstreamPoolId).uuid().not_null())
+                    .col(
+                        ColumnDef::new(Routes::Enabled)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(
+                        ColumnDef::new(Routes::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        ColumnDef::new(Routes::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Routes::Table, Routes::ListenerId)
+                            .to(Listeners::Table, Listeners::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Routes::Table, Routes::UpstreamPoolId)
+                            .to(UpstreamPools::Table, UpstreamPools::Id),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(TlsPolicies::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(TlsPolicies::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(TlsPolicies::Mode).string().not_null())
+                    .col(
+                        ColumnDef::new(TlsPolicies::Domains)
+                            .array(ColumnType::String(StringLen::None))
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(TlsPolicies::Status).string().not_null())
+                    .col(
+                        ColumnDef::new(TlsPolicies::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        ColumnDef::new(TlsPolicies::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(Certificates::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(Certificates::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Certificates::Domain).string().not_null())
+                    .col(ColumnDef::new(Certificates::CertPem).text().not_null())
+                    .col(ColumnDef::new(Certificates::KeyPem).text().not_null())
+                    .col(
+                        ColumnDef::new(Certificates::ExpiresAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Certificates::Status).string().not_null())
+                    .col(
+                        ColumnDef::new(Certificates::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        ColumnDef::new(Certificates::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(ConfigVersions::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(ConfigVersions::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(ConfigVersions::SnapshotJson).json_binary().not_null())
+                    .col(ColumnDef::new(ConfigVersions::Status).string().not_null())
+                    .col(ColumnDef::new(ConfigVersions::CreatedBy).string().not_null())
+                    .col(
+                        ColumnDef::new(ConfigVersions::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(NodeStatus::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(NodeStatus::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(NodeStatus::NodeId).string().not_null())
+                    .col(ColumnDef::new(NodeStatus::VersionId).uuid())
+                    .col(
+                        ColumnDef::new(NodeStatus::HeartbeatAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(NodeStatus::Metadata).json_binary())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(NodeStatus::Table, NodeStatus::VersionId)
+                            .to(ConfigVersions::Table, ConfigVersions::Id),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(AuditLogs::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(AuditLogs::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(AuditLogs::Actor).string().not_null())
+                    .col(ColumnDef::new(AuditLogs::Action).string().not_null())
+                    .col(ColumnDef::new(AuditLogs::Diff).json_binary().not_null())
+                    .col(
+                        ColumnDef::new(AuditLogs::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("listeners_port_protocol_idx")
+                    .table(Listeners::Table)
+                    .col(Listeners::Port)
+                    .col(Listeners::Protocol)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("listeners_enabled_idx")
+                    .table(Listeners::Table)
+                    .col(Listeners::Enabled)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("upstream_pools_name_idx")
+                    .table(UpstreamPools::Table)
+                    .col(UpstreamPools::Name)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("upstream_targets_pool_idx")
+                    .table(UpstreamTargets::Table)
+                    .col(UpstreamTargets::PoolId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("upstream_targets_enabled_idx")
+                    .table(UpstreamTargets::Table)
+                    .col(UpstreamTargets::Enabled)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("routes_listener_idx")
+                    .table(Routes::Table)
+                    .col(Routes::ListenerId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("routes_enabled_idx")
+                    .table(Routes::Table)
+                    .col(Routes::Enabled)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("routes_priority_idx")
+                    .table(Routes::Table)
+                    .col(Routes::Priority)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("tls_policies_domains_idx")
+                    .table(TlsPolicies::Table)
+                    .col(TlsPolicies::Domains)
+                    .index_type(IndexType::FullText)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("certificates_domain_idx")
+                    .table(Certificates::Table)
+                    .col(Certificates::Domain)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("certificates_expires_idx")
+                    .table(Certificates::Table)
+                    .col(Certificates::ExpiresAt)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("config_versions_status_idx")
+                    .table(ConfigVersions::Table)
+                    .col(ConfigVersions::Status)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("config_versions_created_idx")
+                    .table(ConfigVersions::Table)
+                    .col(ConfigVersions::CreatedAt)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("node_status_node_idx")
+                    .table(NodeStatus::Table)
+                    .col(NodeStatus::NodeId)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("node_status_heartbeat_idx")
+                    .table(NodeStatus::Table)
+                    .col(NodeStatus::HeartbeatAt)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("node_status_version_idx")
+                    .table(NodeStatus::Table)
+                    .col(NodeStatus::VersionId)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("audit_logs_actor_idx")
+                    .table(AuditLogs::Table)
+                    .col(AuditLogs::Actor)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("audit_logs_created_idx")
+                    .table(AuditLogs::Table)
+                    .col(AuditLogs::CreatedAt)
+                    .to_owned(),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager.drop_table(Table::drop().table(AuditLogs::Table).to_owned()).await?;
+        manager
+            .drop_table(Table::drop().table(NodeStatus::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(ConfigVersions::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(Certificates::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(TlsPolicies::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(Routes::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(UpstreamTargets::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(UpstreamPools::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(Listeners::Table).to_owned())
+            .await?;
+        Ok(())
+    }
+}
+
+#[derive(Iden)]
+enum Listeners {
+    Table,
+    Id,
+    Name,
+    Port,
+    Protocol,
+    TlsPolicyId,
+    Enabled,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum UpstreamPools {
+    Table,
+    Id,
+    Name,
+    Policy,
+    HealthCheck,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum UpstreamTargets {
+    Table,
+    Id,
+    PoolId,
+    Address,
+    Weight,
+    Enabled,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum Routes {
+    Table,
+    Id,
+    ListenerId,
+    Type,
+    MatchExpr,
+    Priority,
+    UpstreamPoolId,
+    Enabled,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum TlsPolicies {
+    Table,
+    Id,
+    Mode,
+    Domains,
+    Status,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum Certificates {
+    Table,
+    Id,
+    Domain,
+    CertPem,
+    KeyPem,
+    ExpiresAt,
+    Status,
+    CreatedAt,
+    UpdatedAt,
+}
+
+#[derive(Iden)]
+enum ConfigVersions {
+    Table,
+    Id,
+    SnapshotJson,
+    Status,
+    CreatedBy,
+    CreatedAt,
+}
+
+#[derive(Iden)]
+enum NodeStatus {
+    Table,
+    Id,
+    NodeId,
+    VersionId,
+    HeartbeatAt,
+    Metadata,
+}
+
+#[derive(Iden)]
+enum AuditLogs {
+    Table,
+    Id,
+    Actor,
+    Action,
+    Diff,
+    CreatedAt,
+}
