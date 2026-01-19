@@ -1,21 +1,19 @@
 use crate::error::AppError;
 use crate::state::AppState;
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::routing::{get, patch, post};
+use chrono::Utc;
 use gateway_common::entities::{
     audit_logs, config_versions, listeners, node_status, routes, tls_policies, upstream_pools,
     upstream_targets,
 };
 use gateway_common::models::*;
-use gateway_common::snapshot::{build_snapshot, PublishedSnapshotResponse, Snapshot};
-use axum::extract::{Path, Query, State};
-use axum::routing::{get, patch, post};
-use axum::Json;
-use chrono::Utc;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set,
-};
+use gateway_common::snapshot::{PublishedSnapshotResponse, Snapshot, build_snapshot};
 use sea_orm::sea_query::Expr;
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use std::collections::HashSet;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -35,10 +33,15 @@ type AuditLogModel = audit_logs::Model;
 pub fn router(state: AppState) -> axum::Router {
     let static_files = ServeDir::new("web/dist").fallback(ServeFile::new("web/dist/index.html"));
     axum::Router::new()
-        .route("/api/v1/listeners", post(create_listener).get(list_listeners))
+        .route(
+            "/api/v1/listeners",
+            post(create_listener).get(list_listeners),
+        )
         .route(
             "/api/v1/listeners/{id}",
-            get(get_listener).patch(update_listener).delete(delete_listener),
+            get(get_listener)
+                .patch(update_listener)
+                .delete(delete_listener),
         )
         .route("/api/v1/routes", post(create_route).get(list_routes))
         .route(
@@ -50,20 +53,17 @@ pub fn router(state: AppState) -> axum::Router {
             "/api/v1/upstreams/{id}",
             get(get_pool).patch(update_pool).delete(delete_pool),
         )
-        .route(
-            "/api/v1/upstreams/{id}/targets",
-            post(create_target),
-        )
+        .route("/api/v1/upstreams/{id}/targets", post(create_target))
         .route(
             "/api/v1/targets/{id}",
             patch(update_target).delete(delete_target),
         )
         .route("/api/v1/targets", get(list_targets))
-        .route("/api/v1/tls/policies", post(create_tls_policy).get(list_tls))
         .route(
-            "/api/v1/tls/policies/{id}",
-            patch(update_tls_policy),
+            "/api/v1/tls/policies",
+            post(create_tls_policy).get(list_tls),
         )
+        .route("/api/v1/tls/policies/{id}", patch(update_tls_policy))
         .route("/api/v1/certificates/renew", post(renew_certificate))
         .route("/api/v1/config/validate", post(validate_config))
         .route("/api/v1/config/publish", post(publish_config))
@@ -302,7 +302,9 @@ async fn delete_pool(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<JsonValue>> {
-    upstream_pools::Entity::delete_by_id(id).exec(&state.db).await?;
+    upstream_pools::Entity::delete_by_id(id)
+        .exec(&state.db)
+        .await?;
     Ok(Json(json!({"deleted": true})))
 }
 
@@ -355,7 +357,9 @@ async fn delete_target(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<JsonValue>> {
-    upstream_targets::Entity::delete_by_id(id).exec(&state.db).await?;
+    upstream_targets::Entity::delete_by_id(id)
+        .exec(&state.db)
+        .await?;
     Ok(Json(json!({"deleted": true})))
 }
 
@@ -456,7 +460,12 @@ struct ValidateResponse {
 async fn validate_config(State(state): State<AppState>) -> ApiResult<Json<ValidateResponse>> {
     let snapshot = build_snapshot(&state.db).await?;
     let mut errors = Vec::new();
-    validate_snapshot(&snapshot, &mut errors);
+    validate_snapshot(
+        &snapshot,
+        &mut errors,
+        state.http_port_range,
+        state.https_port_range,
+    );
     Ok(Json(ValidateResponse {
         valid: errors.is_empty(),
         errors,
@@ -469,7 +478,12 @@ async fn publish_config(
 ) -> ApiResult<Json<ConfigVersionModel>> {
     let snapshot = build_snapshot(&state.db).await?;
     let mut errors = Vec::new();
-    validate_snapshot(&snapshot, &mut errors);
+    validate_snapshot(
+        &snapshot,
+        &mut errors,
+        state.http_port_range,
+        state.https_port_range,
+    );
     if !errors.is_empty() {
         return Err(AppError::BadRequest(errors.join("; ")));
     }
@@ -492,7 +506,13 @@ async fn publish_config(
     };
     let version = active.insert(&state.db).await?;
 
-    add_audit(&state.db, &payload.actor, "publish", json!({"version_id": version.id})).await?;
+    add_audit(
+        &state.db,
+        &payload.actor,
+        "publish",
+        json!({"version_id": version.id}),
+    )
+    .await?;
 
     state.snapshots.apply(snapshot).await?;
     Ok(Json(version))
@@ -522,7 +542,13 @@ async fn rollback_config(
         .map_err(|err| AppError::Internal(err.into()))?;
     state.snapshots.apply(snapshot).await?;
 
-    add_audit(&state.db, &payload.actor, "rollback", json!({"version_id": version.id})).await?;
+    add_audit(
+        &state.db,
+        &payload.actor,
+        "rollback",
+        json!({"version_id": version.id}),
+    )
+    .await?;
 
     Ok(Json(version))
 }
@@ -658,18 +684,89 @@ async fn add_audit(
     active.insert(db).await.map(|_| ())
 }
 
-fn validate_snapshot(snapshot: &Snapshot, errors: &mut Vec<String>) {
+fn validate_snapshot(
+    snapshot: &Snapshot,
+    errors: &mut Vec<String>,
+    http_port_range: Option<gateway_common::config::PortRange>,
+    https_port_range: Option<gateway_common::config::PortRange>,
+) {
+    if let (Some(http), Some(https)) = (http_port_range, https_port_range) {
+        let overlap = http.start.max(https.start) <= http.end.min(https.end);
+        if overlap {
+            errors.push(format!(
+                "HTTP_PORT_RANGE {}-{} overlaps HTTPS_PORT_RANGE {}-{}",
+                http.start, http.end, https.start, https.end
+            ));
+        }
+    }
+
     let listener_ids: HashSet<Uuid> = snapshot.listeners.iter().map(|l| l.id).collect();
+    let enabled_listener_ids: HashSet<Uuid> = snapshot
+        .listeners
+        .iter()
+        .filter(|l| l.enabled)
+        .map(|l| l.id)
+        .collect();
     let pool_ids: HashSet<Uuid> = snapshot.upstream_pools.iter().map(|p| p.id).collect();
     let tls_ids: HashSet<Uuid> = snapshot.tls_policies.iter().map(|p| p.id).collect();
 
-    let mut ports = HashSet::new();
+    let mut protocol_ports = HashSet::new();
+    let mut bind_ports = HashSet::new();
     for listener in &snapshot.listeners {
         let key = format!("{}:{}", listener.protocol, listener.port);
-        if !ports.insert(key.clone()) {
+        if !protocol_ports.insert(key.clone()) {
             errors.push(format!("duplicate listener {}", key));
         }
-        validate_listener(listener, &tls_ids, errors);
+        if listener.enabled {
+            if !(1..=65535).contains(&listener.port) {
+                errors.push(format!(
+                    "listener {} invalid port {}",
+                    listener.id, listener.port
+                ));
+            } else {
+                let port = listener.port as u16;
+                if !bind_ports.insert(port) {
+                    errors.push(format!("duplicate port {}", port));
+                }
+                if listener.protocol.eq_ignore_ascii_case("https") {
+                    if let Some(range) = https_port_range {
+                        if !range.contains(port) {
+                            errors.push(format!(
+                                "listener {} https port {} outside HTTPS_PORT_RANGE",
+                                listener.id, port
+                            ));
+                        }
+                    }
+                    if let Some(range) = http_port_range {
+                        if range.contains(port) {
+                            errors.push(format!(
+                                "listener {} https port {} conflicts with HTTP_PORT_RANGE",
+                                listener.id, port
+                            ));
+                        }
+                    }
+                } else {
+                    if let Some(range) = http_port_range {
+                        if !range.contains(port) {
+                            errors.push(format!(
+                                "listener {} http port {} outside HTTP_PORT_RANGE",
+                                listener.id, port
+                            ));
+                        }
+                    }
+                    if let Some(range) = https_port_range {
+                        if range.contains(port) {
+                            errors.push(format!(
+                                "listener {} http port {} conflicts with HTTPS_PORT_RANGE",
+                                listener.id, port
+                            ));
+                        }
+                    }
+                }
+            }
+
+            validate_listener(listener, &tls_ids, errors);
+        }
     }
 
     for pool in &snapshot.upstream_pools {
@@ -685,7 +782,13 @@ fn validate_snapshot(snapshot: &Snapshot, errors: &mut Vec<String>) {
     }
 
     for route in &snapshot.routes {
-        validate_route(route, &listener_ids, &pool_ids, errors);
+        validate_route(
+            route,
+            &listener_ids,
+            &enabled_listener_ids,
+            &pool_ids,
+            errors,
+        );
     }
 }
 
@@ -695,7 +798,10 @@ fn validate_listener(
     errors: &mut Vec<String>,
 ) {
     if !(1..=65535).contains(&listener.port) {
-        errors.push(format!("listener {} invalid port {}", listener.id, listener.port));
+        errors.push(format!(
+            "listener {} invalid port {}",
+            listener.id, listener.port
+        ));
     }
     match listener.protocol.to_ascii_lowercase().as_str() {
         "http" | "https" => {}
@@ -707,10 +813,7 @@ fn validate_listener(
     if listener.protocol.eq_ignore_ascii_case("https") {
         match listener.tls_policy_id {
             Some(id) if tls_ids.contains(&id) => {}
-            Some(_) => errors.push(format!(
-                "listener {} tls_policy_id not found",
-                listener.id
-            )),
+            Some(_) => errors.push(format!("listener {} tls_policy_id not found", listener.id)),
             None => errors.push(format!(
                 "listener {} https requires tls_policy_id",
                 listener.id
@@ -722,7 +825,7 @@ fn validate_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use gateway_common::snapshot::Snapshot;
     use gateway_common::state::SnapshotStore;
@@ -736,6 +839,8 @@ mod tests {
             db: DatabaseConnection::default(),
             snapshots,
             acme_store: crate::acme::AcmeChallengeStore::default(),
+            http_port_range: None,
+            https_port_range: None,
         };
 
         let app = router(state);
@@ -764,7 +869,10 @@ fn validate_upstream_pool(
 ) {
     match pool.policy.to_ascii_lowercase().as_str() {
         "round_robin" | "least_conn" | "weighted" => {}
-        _ => errors.push(format!("upstream pool {} invalid policy {}", pool.id, pool.policy)),
+        _ => errors.push(format!(
+            "upstream pool {} invalid policy {}",
+            pool.id, pool.policy
+        )),
     }
 }
 
@@ -802,7 +910,10 @@ fn validate_tls_policy(
     }
     match policy.mode.to_ascii_lowercase().as_str() {
         "auto" | "manual" => {}
-        _ => errors.push(format!("tls policy {} invalid mode {}", policy.id, policy.mode)),
+        _ => errors.push(format!(
+            "tls policy {} invalid mode {}",
+            policy.id, policy.mode
+        )),
     }
     match policy.status.to_ascii_lowercase().as_str() {
         "active" | "error" | "pending" => {}
@@ -816,12 +927,19 @@ fn validate_tls_policy(
 fn validate_route(
     route: &gateway_common::entities::routes::Model,
     listener_ids: &HashSet<Uuid>,
+    enabled_listener_ids: &HashSet<Uuid>,
     pool_ids: &HashSet<Uuid>,
     errors: &mut Vec<String>,
 ) {
     if !listener_ids.contains(&route.listener_id) {
         errors.push(format!(
             "route {} listener not found {}",
+            route.id, route.listener_id
+        ));
+    }
+    if route.enabled && !enabled_listener_ids.contains(&route.listener_id) {
+        errors.push(format!(
+            "route {} references disabled listener {}",
             route.id, route.listener_id
         ));
     }
@@ -871,7 +989,10 @@ fn validate_route(
             }
             Err(_) => errors.push(format!("invalid match_expr for route {}", route.id)),
         },
-        _ => errors.push(format!("invalid route type {} for route {}", route.r#type, route.id)),
+        _ => errors.push(format!(
+            "invalid route type {} for route {}",
+            route.r#type, route.id
+        )),
     }
 }
 

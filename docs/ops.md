@@ -57,6 +57,7 @@
 - 示例（只跑控制平面）：`RUN_DATA_PLANE=false`，并确保设置 `DATABASE_URL`。
 - 示例（只跑数据平面）：`RUN_CONTROL_PLANE=false`，并确保设置 `CONTROL_PLANE_URL`（指向控制平面）。
 - 若需要“新增端口不重启数据平面”，建议使用 `HTTP_PORT_RANGE`/`HTTPS_PORT_RANGE` 预绑定端口段，并在容器/集群层面提前暴露对应端口范围（Docker 需要启动时 `-p` 映射范围；K8s 需要在 Service 中声明端口）。
+- 建议在控制平面也配置相同的 `HTTP_PORT_RANGE`/`HTTPS_PORT_RANGE`，这样 `/api/v1/config/validate` 与发布会在服务端阻止端口越界或端口段冲突。
 
 ## 发布与回滚
 - 发布：先调用 `/api/v1/config/validate`，再调用 `/api/v1/config/publish`。

@@ -7,9 +7,9 @@ mod state;
 use crate::acme::AcmeChallengeStore;
 use crate::db::init_db;
 use crate::state::AppState;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use gateway_common::config::AppConfig;
-use gateway_common::snapshot::{build_snapshot, Snapshot};
+use gateway_common::snapshot::{Snapshot, build_snapshot};
 use gateway_common::state::SnapshotStore;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use tracing::{info, warn};
@@ -34,6 +34,8 @@ async fn main() -> Result<()> {
         db: db.clone(),
         snapshots: snapshots.clone(),
         acme_store: AcmeChallengeStore::default(),
+        http_port_range: config.http_port_range,
+        https_port_range: config.https_port_range,
     };
 
     let control_addr = config.control_plane_addr.clone();
