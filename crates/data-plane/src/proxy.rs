@@ -2,6 +2,7 @@ use crate::tls::CertPaths;
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
 use bytes::Bytes;
+use gateway_common::config::PortRange;
 use gateway_common::entities::upstream_targets::Model as UpstreamTarget;
 use gateway_common::models::RouteMatch;
 use gateway_common::snapshot::Snapshot;
@@ -14,27 +15,24 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct ProxyRouter {
-    listener_id: Uuid,
     runtime: Arc<RwLock<RuntimeConfig>>,
     acme_client: Option<AcmeChallengeClient>,
 }
 
 impl ProxyRouter {
     pub fn new(
-        listener_id: Uuid,
         runtime: Arc<RwLock<RuntimeConfig>>,
         acme_client: Option<AcmeChallengeClient>,
     ) -> Self {
         Self {
-            listener_id,
             runtime,
             acme_client,
         }
@@ -79,21 +77,23 @@ impl ProxyHttp for ProxyRouter {
         Ok(false)
     }
 
-    async fn upstream_peer(
-        &self,
-        session: &mut Session,
-        _ctx: &mut (),
-    ) -> Result<Box<HttpPeer>> {
+    async fn upstream_peer(&self, session: &mut Session, _ctx: &mut ()) -> Result<Box<HttpPeer>> {
         let header = session.req_header();
+        let port = session
+            .as_downstream()
+            .server_addr()
+            .and_then(|addr| addr.as_inet().map(|inet| inet.port()))
+            .ok_or_else(|| {
+                Error::explain(ErrorType::InternalError, "missing downstream server_addr")
+            })?;
         let runtime = self.runtime.read().await;
-        let routes = match runtime.routes_by_listener.get(&self.listener_id) {
+        let listener = match runtime.listeners_by_port.get(&port) {
+            Some(listener) => listener,
+            None => return Err(Error::explain(ErrorType::HTTPStatus(404), "no listener")),
+        };
+        let routes = match runtime.routes_by_listener.get(&listener.id) {
             Some(routes) => routes,
-            None => {
-                return Err(Error::explain(
-                    ErrorType::InternalError,
-                    "no routes for listener",
-                ))
-            }
+            None => return Err(Error::explain(ErrorType::HTTPStatus(404), "no routes")),
         };
 
         for route in routes {
@@ -115,6 +115,7 @@ impl ProxyHttp for ProxyRouter {
 
 pub struct RuntimeConfig {
     pub listeners: Vec<ListenerRuntime>,
+    pub listeners_by_port: HashMap<u16, ListenerRuntime>,
     pub routes_by_listener: HashMap<Uuid, Vec<RouteRule>>,
     pools: HashMap<Uuid, PoolRuntime>,
 }
@@ -201,11 +202,15 @@ impl RouteMatcher {
         }
 
         let path = header.uri.path();
-        if let Some(prefix) = &self.path_prefix && !path.starts_with(prefix) {
+        if let Some(prefix) = &self.path_prefix
+            && !path.starts_with(prefix)
+        {
             return false;
         }
 
-        if let Some(regex) = &self.path_regex && !regex.is_match(path) {
+        if let Some(regex) = &self.path_regex
+            && !regex.is_match(path)
+        {
             return false;
         }
 
@@ -239,7 +244,9 @@ impl RouteMatcher {
             }
         }
 
-        if let Some(ws_required) = self.ws && ws_required != is_ws_request(header) {
+        if let Some(ws_required) = self.ws
+            && ws_required != is_ws_request(header)
+        {
             return false;
         }
 
@@ -306,6 +313,8 @@ impl PoolRuntime {
 pub fn build_runtime(
     snapshot: &Snapshot,
     certs: &HashMap<Uuid, CertPaths>,
+    http_port_range: Option<PortRange>,
+    https_port_range: Option<PortRange>,
 ) -> AnyResult<RuntimeConfig> {
     let mut pools = HashMap::new();
     for pool in &snapshot.upstream_pools {
@@ -363,10 +372,57 @@ pub fn build_runtime(
         routes.sort_by(|a, b| b.priority.cmp(&a.priority));
     }
 
-    let listeners = snapshot
+    let listeners: Vec<ListenerRuntime> = snapshot
         .listeners
         .iter()
         .filter(|l| l.enabled)
+        .filter(|l| {
+            if !(1..=65535).contains(&l.port) {
+                warn!("invalid listener port {} for listener {}", l.port, l.id);
+                return false;
+            }
+            let port = l.port as u16;
+            if l.protocol.eq_ignore_ascii_case("https") {
+                if let Some(range) = https_port_range {
+                    if !range.contains(port) {
+                        warn!(
+                            "https listener {} port {} outside HTTPS_PORT_RANGE",
+                            l.id, port
+                        );
+                        return false;
+                    }
+                }
+                if let Some(range) = http_port_range {
+                    if range.contains(port) {
+                        warn!(
+                            "https listener {} port {} conflicts with HTTP_PORT_RANGE",
+                            l.id, port
+                        );
+                        return false;
+                    }
+                }
+            } else {
+                if let Some(range) = http_port_range {
+                    if !range.contains(port) {
+                        warn!(
+                            "http listener {} port {} outside HTTP_PORT_RANGE",
+                            l.id, port
+                        );
+                        return false;
+                    }
+                }
+                if let Some(range) = https_port_range {
+                    if range.contains(port) {
+                        warn!(
+                            "http listener {} port {} conflicts with HTTPS_PORT_RANGE",
+                            l.id, port
+                        );
+                        return false;
+                    }
+                }
+            }
+            true
+        })
         .map(|l| ListenerRuntime {
             id: l.id,
             port: l.port,
@@ -380,8 +436,16 @@ pub fn build_runtime(
         })
         .collect();
 
+    let mut listeners_by_port: HashMap<u16, ListenerRuntime> = HashMap::new();
+    for listener in &listeners {
+        if (1..=65535).contains(&listener.port) {
+            listeners_by_port.insert(listener.port as u16, listener.clone());
+        }
+    }
+
     Ok(RuntimeConfig {
         listeners,
+        listeners_by_port,
         routes_by_listener,
         pools,
     })
@@ -454,8 +518,10 @@ pub async fn apply_snapshot(
     runtime: &Arc<RwLock<RuntimeConfig>>,
     snapshot: &Snapshot,
     certs: &HashMap<Uuid, CertPaths>,
+    http_port_range: Option<PortRange>,
+    https_port_range: Option<PortRange>,
 ) -> AnyResult<()> {
-    let new_runtime = build_runtime(snapshot, certs)?;
+    let new_runtime = build_runtime(snapshot, certs, http_port_range, https_port_range)?;
     *runtime.write().await = new_runtime;
     Ok(())
 }

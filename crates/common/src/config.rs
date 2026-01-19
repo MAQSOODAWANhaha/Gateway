@@ -1,6 +1,22 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::env;
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl PortRange {
+    pub fn contains(&self, port: u16) -> bool {
+        port >= self.start && port <= self.end
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = u16> {
+        self.start..=self.end
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -19,6 +35,8 @@ pub struct AppConfig {
     pub acme_directory_url: String,
     pub acme_storage_dir: PathBuf,
     pub certs_dir: PathBuf,
+    pub http_port_range: Option<PortRange>,
+    pub https_port_range: Option<PortRange>,
 }
 
 impl AppConfig {
@@ -30,7 +48,9 @@ impl AppConfig {
 
         let database_url = env::var("DATABASE_URL").ok();
         if run_control_plane && database_url.is_none() {
-            return Err(anyhow!("DATABASE_URL is required when RUN_CONTROL_PLANE=true"));
+            return Err(anyhow!(
+                "DATABASE_URL is required when RUN_CONTROL_PLANE=true"
+            ));
         }
 
         let control_plane_addr =
@@ -46,15 +66,17 @@ impl AppConfig {
 
         let acme_enabled = env_bool("ACME_ENABLED", false);
         let acme_contact_email = env::var("ACME_CONTACT_EMAIL").ok();
-        let acme_directory_url = env::var("ACME_DIRECTORY_URL").unwrap_or_else(|_| {
-            "https://acme-v02.api.letsencrypt.org/directory".to_string()
-        });
+        let acme_directory_url = env::var("ACME_DIRECTORY_URL")
+            .unwrap_or_else(|_| "https://acme-v02.api.letsencrypt.org/directory".to_string());
         let acme_storage_dir = env::var("ACME_STORAGE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("data/acme"));
         let certs_dir = env::var("CERTS_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("data/certs"));
+
+        let http_port_range = env_port_range("HTTP_PORT_RANGE")?;
+        let https_port_range = env_port_range("HTTPS_PORT_RANGE")?;
         Ok(Self {
             database_url,
             control_plane_addr,
@@ -71,6 +93,8 @@ impl AppConfig {
             acme_directory_url,
             acme_storage_dir,
             certs_dir,
+            http_port_range,
+            https_port_range,
         })
     }
 }
@@ -87,4 +111,29 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+fn env_port_range(key: &str) -> Result<Option<PortRange>> {
+    let raw = match env::var(key) {
+        Ok(v) => v.trim().to_string(),
+        Err(_) => return Ok(None),
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let (start, end) = raw
+        .split_once('-')
+        .ok_or_else(|| anyhow!("{} must be in form start-end", key))?;
+    let start: u16 = start
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("{} invalid start port", key))?;
+    let end: u16 = end
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("{} invalid end port", key))?;
+    if start == 0 || end == 0 || start > end {
+        return Err(anyhow!("{} invalid range {}-{}", key, start, end));
+    }
+    Ok(Some(PortRange { start, end }))
 }

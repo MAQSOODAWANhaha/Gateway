@@ -20,6 +20,8 @@
 - `HEALTH_CHECK_INTERVAL_SECS`：上游健康检查间隔（默认 5）。
 - `HEALTH_CHECK_TIMEOUT_MS`：健康检查超时（默认 800）。
 - `CERTS_DIR`：证书落盘目录（默认 `data/certs`）。
+- `HTTP_PORT_RANGE`：数据平面预绑定的 HTTP 端口范围（例如 `20000-20100`，未设置则仅监听已配置监听器端口）。
+- `HTTPS_PORT_RANGE`：数据平面预绑定的 HTTPS 端口范围（例如 `21000-21100`，未设置则仅监听已配置监听器端口）。
 
 ### 控制平面
 - `DATABASE_URL`：Postgres 连接串（控制平面必填）。
@@ -54,6 +56,7 @@
 - 通过环境变量开关控制进程：`RUN_CONTROL_PLANE=true|false`、`RUN_DATA_PLANE=true|false`。
 - 示例（只跑控制平面）：`RUN_DATA_PLANE=false`，并确保设置 `DATABASE_URL`。
 - 示例（只跑数据平面）：`RUN_CONTROL_PLANE=false`，并确保设置 `CONTROL_PLANE_URL`（指向控制平面）。
+- 若需要“新增端口不重启数据平面”，建议使用 `HTTP_PORT_RANGE`/`HTTPS_PORT_RANGE` 预绑定端口段，并在容器/集群层面提前暴露对应端口范围（Docker 需要启动时 `-p` 映射范围；K8s 需要在 Service 中声明端口）。
 
 ## 发布与回滚
 - 发布：先调用 `/api/v1/config/validate`，再调用 `/api/v1/config/publish`。

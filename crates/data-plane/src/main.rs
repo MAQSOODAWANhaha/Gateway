@@ -25,10 +25,26 @@ async fn main() -> Result<()> {
     let snapshot = Snapshot::default();
     let (snapshots, mut snapshot_rx) = SnapshotStore::new(snapshot.clone());
 
+    let http_port_range = config.http_port_range;
+    let https_port_range = config.https_port_range;
+
     let certs = tls::materialize_certs(&snapshot, &config.certs_dir)?;
-    let runtime = Arc::new(RwLock::new(proxy::build_runtime(&snapshot, &certs)?));
+    let https_port_certs = if let Some(range) = https_port_range {
+        tls::materialize_https_port_certs(&snapshot, &config.certs_dir, range.iter(), &certs)?
+    } else {
+        Default::default()
+    };
+
+    let runtime = Arc::new(RwLock::new(proxy::build_runtime(
+        &snapshot,
+        &certs,
+        http_port_range,
+        https_port_range,
+    )?));
     let runtime_for_updates = runtime.clone();
     let certs_dir = config.certs_dir.clone();
+    let http_port_range_for_updates = http_port_range;
+    let https_port_range_for_updates = https_port_range;
     tokio::spawn(async move {
         while snapshot_rx.changed().await.is_ok() {
             let snapshot = snapshot_rx.borrow().clone();
@@ -39,7 +55,22 @@ async fn main() -> Result<()> {
                     continue;
                 }
             };
-            if let Err(err) = proxy::apply_snapshot(&runtime_for_updates, &snapshot, &certs).await {
+            if let Some(range) = https_port_range_for_updates {
+                if let Err(err) =
+                    tls::materialize_https_port_certs(&snapshot, &certs_dir, range.iter(), &certs)
+                {
+                    warn!("failed to materialize https port certs: {}", err);
+                }
+            }
+            if let Err(err) = proxy::apply_snapshot(
+                &runtime_for_updates,
+                &snapshot,
+                &certs,
+                http_port_range_for_updates,
+                https_port_range_for_updates,
+            )
+            .await
+            {
                 warn!("failed to apply snapshot: {}", err);
             }
         }
@@ -63,40 +94,68 @@ async fn main() -> Result<()> {
         health::run_health_checks(runtime_for_health, health_interval, health_timeout).await;
     }));
 
-    let listeners = runtime.read().await.listeners.clone();
-    if listeners.is_empty() {
-        warn!("no listeners configured at startup; restart required after publish");
-    }
     let mut server = Server::new(None)?;
     server.bootstrap();
 
     let acme_client = AcmeChallengeClient::new(config.control_plane_url.clone());
 
-    for listener in listeners {
-        let router = proxy::ProxyRouter::new(
-            listener.id,
-            runtime.clone(),
-            Some(acme_client.clone()),
-        );
-        let mut service = http_proxy_service(&server.configuration, router);
-        let addr = format!("0.0.0.0:{}", listener.port);
-        if listener.protocol.eq_ignore_ascii_case("https") {
-            if let (Some(cert_path), Some(key_path)) =
-                (listener.tls_cert_path.as_ref(), listener.tls_key_path.as_ref())
-            {
-                let cert_path = cert_path.to_string_lossy().to_string();
-                let key_path = key_path.to_string_lossy().to_string();
-                service.add_tls(&addr, &cert_path, &key_path)?;
-            } else {
-                warn!("TLS listener {} missing certs; skipping", listener.id);
-                continue;
-            }
-        } else {
+    let router = proxy::ProxyRouter::new(runtime.clone(), Some(acme_client.clone()));
+    let mut service = http_proxy_service(&server.configuration, router);
+
+    if let Some(range) = http_port_range {
+        for port in range.iter() {
+            let addr = format!("0.0.0.0:{}", port);
             service.add_tcp(&addr);
         }
-        server.add_service(service);
-        info!("data plane listening on {} ({})", addr, listener.protocol);
+        info!(
+            "data plane pre-bound HTTP ports {}-{}",
+            range.start, range.end
+        );
     }
+
+    if let Some(range) = https_port_range {
+        for port in range.iter() {
+            let paths = https_port_certs
+                .get(&port)
+                .expect("https port certs must be materialized for configured range");
+            let addr = format!("0.0.0.0:{}", port);
+            let cert_path = paths.cert_path.to_string_lossy().to_string();
+            let key_path = paths.key_path.to_string_lossy().to_string();
+            service.add_tls(&addr, &cert_path, &key_path)?;
+        }
+        info!(
+            "data plane pre-bound HTTPS ports {}-{}",
+            range.start, range.end
+        );
+    }
+
+    if http_port_range.is_none() && https_port_range.is_none() {
+        let listeners = runtime.read().await.listeners.clone();
+        if listeners.is_empty() {
+            warn!("no listeners configured at startup; restart required after publish");
+        }
+        for listener in listeners {
+            let addr = format!("0.0.0.0:{}", listener.port);
+            if listener.protocol.eq_ignore_ascii_case("https") {
+                if let (Some(cert_path), Some(key_path)) = (
+                    listener.tls_cert_path.as_ref(),
+                    listener.tls_key_path.as_ref(),
+                ) {
+                    let cert_path = cert_path.to_string_lossy().to_string();
+                    let key_path = key_path.to_string_lossy().to_string();
+                    service.add_tls(&addr, &cert_path, &key_path)?;
+                } else {
+                    warn!("TLS listener {} missing certs; skipping", listener.id);
+                    continue;
+                }
+            } else {
+                service.add_tcp(&addr);
+            }
+            info!("data plane listening on {} ({})", addr, listener.protocol);
+        }
+    }
+
+    server.add_service(service);
 
     tasks.push(tokio::task::spawn_blocking(move || {
         server.run_forever();

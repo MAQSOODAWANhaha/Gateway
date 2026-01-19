@@ -16,5 +16,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+rcgen = { workspace = true }
 
 gateway-common = { path = "../common" }
