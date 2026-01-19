@@ -8976,3 +8976,4 @@ web/node_modules/zod/v4-mini/package.json
 .env
 web/node_modules/
 web/.vite/
+.cargo_home/

@@ -1,4 +1,4 @@
-use crate::tls::CertPaths;
+use crate::tls::TlsKeyPairPem;
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -8,7 +8,9 @@ use gateway_common::models::RouteMatch;
 use gateway_common::snapshot::Snapshot;
 use pingora::http::RequestHeader;
 use pingora::http::ResponseHeader;
+use pingora::listeners::TlsAccept;
 use pingora::prelude::*;
+use pingora::protocols::tls::TlsRef;
 use pingora::proxy::ProxyHttp;
 use regex::Regex;
 use reqwest::Client;
@@ -116,6 +118,7 @@ impl ProxyHttp for ProxyRouter {
 pub struct RuntimeConfig {
     pub listeners: Vec<ListenerRuntime>,
     pub listeners_by_port: HashMap<u16, ListenerRuntime>,
+    pub tls_by_port: HashMap<u16, Arc<TlsKeyPair>>,
     pub routes_by_listener: HashMap<Uuid, Vec<RouteRule>>,
     pools: HashMap<Uuid, PoolRuntime>,
 }
@@ -125,8 +128,41 @@ pub struct ListenerRuntime {
     pub id: Uuid,
     pub port: i32,
     pub protocol: String,
-    pub tls_cert_path: Option<std::path::PathBuf>,
-    pub tls_key_path: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone)]
+pub struct TlsKeyPair {
+    leaf: pingora::tls::x509::X509,
+    chain: Vec<pingora::tls::x509::X509>,
+    key: pingora::tls::pkey::PKey<pingora::tls::pkey::Private>,
+}
+
+pub struct PortTlsSelector {
+    port: u16,
+    runtime: Arc<RwLock<RuntimeConfig>>,
+}
+
+impl PortTlsSelector {
+    pub fn new(port: u16, runtime: Arc<RwLock<RuntimeConfig>>) -> Self {
+        Self { port, runtime }
+    }
+}
+
+#[async_trait]
+impl TlsAccept for PortTlsSelector {
+    async fn certificate_callback(&self, ssl: &mut TlsRef) -> () {
+        let pair = {
+            let runtime = self.runtime.read().await;
+            runtime.tls_by_port.get(&self.port).cloned()
+        };
+        let Some(pair) = pair else { return };
+
+        let _ = pingora::tls::ext::ssl_use_certificate(ssl, &pair.leaf);
+        for cert in &pair.chain {
+            let _ = pingora::tls::ext::ssl_add_chain_cert(ssl, cert);
+        }
+        let _ = pingora::tls::ext::ssl_use_private_key(ssl, &pair.key);
+    }
 }
 
 #[derive(Clone)]
@@ -312,7 +348,7 @@ impl PoolRuntime {
 
 pub fn build_runtime(
     snapshot: &Snapshot,
-    certs: &HashMap<Uuid, CertPaths>,
+    default_tls_pem: &TlsKeyPairPem,
     http_port_range: Option<PortRange>,
     https_port_range: Option<PortRange>,
 ) -> AnyResult<RuntimeConfig> {
@@ -427,12 +463,6 @@ pub fn build_runtime(
             id: l.id,
             port: l.port,
             protocol: l.protocol.clone(),
-            tls_cert_path: l
-                .tls_policy_id
-                .and_then(|id| certs.get(&id).map(|c| c.cert_path.clone())),
-            tls_key_path: l
-                .tls_policy_id
-                .and_then(|id| certs.get(&id).map(|c| c.key_path.clone())),
         })
         .collect();
 
@@ -443,9 +473,45 @@ pub fn build_runtime(
         }
     }
 
+    let default_tls = Arc::new(parse_tls_keypair(default_tls_pem)?);
+    let mut tls_by_port: HashMap<u16, Arc<TlsKeyPair>> = HashMap::new();
+    if let Some(range) = https_port_range {
+        for port in range.iter() {
+            let pair = match listeners_by_port.get(&port) {
+                Some(listener) if listener.protocol.eq_ignore_ascii_case("https") => snapshot
+                    .listeners
+                    .iter()
+                    .find(|l| l.id == listener.id)
+                    .and_then(|l| l.tls_policy_id)
+                    .and_then(|id| crate::tls::tls_pem_for_policy(snapshot, id))
+                    .and_then(|pem| parse_tls_keypair(&pem).ok().map(Arc::new))
+                    .unwrap_or_else(|| default_tls.clone()),
+                _ => default_tls.clone(),
+            };
+            tls_by_port.insert(port, pair);
+        }
+    } else {
+        for listener in &snapshot.listeners {
+            if !listener.enabled || !listener.protocol.eq_ignore_ascii_case("https") {
+                continue;
+            }
+            if !(1..=65535).contains(&listener.port) {
+                continue;
+            }
+            let port = listener.port as u16;
+            let pair = listener
+                .tls_policy_id
+                .and_then(|id| crate::tls::tls_pem_for_policy(snapshot, id))
+                .and_then(|pem| parse_tls_keypair(&pem).ok().map(Arc::new))
+                .unwrap_or_else(|| default_tls.clone());
+            tls_by_port.insert(port, pair);
+        }
+    }
+
     Ok(RuntimeConfig {
         listeners,
         listeners_by_port,
+        tls_by_port,
         routes_by_listener,
         pools,
     })
@@ -517,13 +583,24 @@ fn is_ws_request(header: &RequestHeader) -> bool {
 pub async fn apply_snapshot(
     runtime: &Arc<RwLock<RuntimeConfig>>,
     snapshot: &Snapshot,
-    certs: &HashMap<Uuid, CertPaths>,
+    default_tls_pem: &TlsKeyPairPem,
     http_port_range: Option<PortRange>,
     https_port_range: Option<PortRange>,
 ) -> AnyResult<()> {
-    let new_runtime = build_runtime(snapshot, certs, http_port_range, https_port_range)?;
+    let new_runtime = build_runtime(snapshot, default_tls_pem, http_port_range, https_port_range)?;
     *runtime.write().await = new_runtime;
     Ok(())
+}
+
+fn parse_tls_keypair(pem: &TlsKeyPairPem) -> AnyResult<TlsKeyPair> {
+    let chain = pingora::tls::x509::X509::stack_from_pem(&pem.cert_pem)?;
+    let mut iter = chain.into_iter();
+    let leaf = iter
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty cert chain"))?;
+    let chain: Vec<pingora::tls::x509::X509> = iter.collect();
+    let key = pingora::tls::pkey::PKey::private_key_from_pem(&pem.key_pem)?;
+    Ok(TlsKeyPair { leaf, chain, key })
 }
 
 struct TargetRuntime {

@@ -11,7 +11,7 @@ RUN npm run build
 FROM rust:1.92.0-bookworm AS rust_builder
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends cmake pkg-config \
+  && apt-get install -y --no-install-recommends cmake pkg-config libssl-dev \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

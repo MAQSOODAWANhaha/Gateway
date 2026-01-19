@@ -7,6 +7,8 @@ use anyhow::Result;
 use gateway_common::config::AppConfig;
 use gateway_common::snapshot::Snapshot;
 use gateway_common::state::SnapshotStore;
+use pingora::listeners::TlsAcceptCallbacks;
+use pingora::listeners::tls::TlsSettings;
 use pingora::proxy::http_proxy_service;
 use pingora::server::Server;
 use proxy::AcmeChallengeClient;
@@ -28,44 +30,25 @@ async fn main() -> Result<()> {
     let http_port_range = config.http_port_range;
     let https_port_range = config.https_port_range;
 
-    let certs = tls::materialize_certs(&snapshot, &config.certs_dir)?;
-    let https_port_certs = if let Some(range) = https_port_range {
-        tls::materialize_https_port_certs(&snapshot, &config.certs_dir, range.iter(), &certs)?
-    } else {
-        Default::default()
-    };
+    let default_tls_pem = Arc::new(tls::default_tls_pem(&config.certs_dir)?);
 
     let runtime = Arc::new(RwLock::new(proxy::build_runtime(
         &snapshot,
-        &certs,
+        &default_tls_pem,
         http_port_range,
         https_port_range,
     )?));
     let runtime_for_updates = runtime.clone();
-    let certs_dir = config.certs_dir.clone();
+    let default_tls_pem_for_updates = default_tls_pem.clone();
     let http_port_range_for_updates = http_port_range;
     let https_port_range_for_updates = https_port_range;
     tokio::spawn(async move {
         while snapshot_rx.changed().await.is_ok() {
             let snapshot = snapshot_rx.borrow().clone();
-            let certs = match tls::materialize_certs(&snapshot, &certs_dir) {
-                Ok(certs) => certs,
-                Err(err) => {
-                    warn!("failed to materialize certs: {}", err);
-                    continue;
-                }
-            };
-            if let Some(range) = https_port_range_for_updates {
-                if let Err(err) =
-                    tls::materialize_https_port_certs(&snapshot, &certs_dir, range.iter(), &certs)
-                {
-                    warn!("failed to materialize https port certs: {}", err);
-                }
-            }
             if let Err(err) = proxy::apply_snapshot(
                 &runtime_for_updates,
                 &snapshot,
-                &certs,
+                &default_tls_pem_for_updates,
                 http_port_range_for_updates,
                 https_port_range_for_updates,
             )
@@ -115,13 +98,11 @@ async fn main() -> Result<()> {
 
     if let Some(range) = https_port_range {
         for port in range.iter() {
-            let paths = https_port_certs
-                .get(&port)
-                .expect("https port certs must be materialized for configured range");
             let addr = format!("0.0.0.0:{}", port);
-            let cert_path = paths.cert_path.to_string_lossy().to_string();
-            let key_path = paths.key_path.to_string_lossy().to_string();
-            service.add_tls(&addr, &cert_path, &key_path)?;
+            let callbacks: TlsAcceptCallbacks =
+                Box::new(proxy::PortTlsSelector::new(port, runtime.clone()));
+            let settings = TlsSettings::with_callbacks(callbacks)?;
+            service.add_tls_with_settings(&addr, None, settings);
         }
         info!(
             "data plane pre-bound HTTPS ports {}-{}",
@@ -137,17 +118,11 @@ async fn main() -> Result<()> {
         for listener in listeners {
             let addr = format!("0.0.0.0:{}", listener.port);
             if listener.protocol.eq_ignore_ascii_case("https") {
-                if let (Some(cert_path), Some(key_path)) = (
-                    listener.tls_cert_path.as_ref(),
-                    listener.tls_key_path.as_ref(),
-                ) {
-                    let cert_path = cert_path.to_string_lossy().to_string();
-                    let key_path = key_path.to_string_lossy().to_string();
-                    service.add_tls(&addr, &cert_path, &key_path)?;
-                } else {
-                    warn!("TLS listener {} missing certs; skipping", listener.id);
-                    continue;
-                }
+                let port = listener.port as u16;
+                let callbacks: TlsAcceptCallbacks =
+                    Box::new(proxy::PortTlsSelector::new(port, runtime.clone()));
+                let settings = TlsSettings::with_callbacks(callbacks)?;
+                service.add_tls_with_settings(&addr, None, settings);
             } else {
                 service.add_tcp(&addr);
             }
