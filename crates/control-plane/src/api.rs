@@ -37,31 +37,31 @@ pub fn router(state: AppState) -> axum::Router {
     axum::Router::new()
         .route("/api/v1/listeners", post(create_listener).get(list_listeners))
         .route(
-            "/api/v1/listeners/:id",
+            "/api/v1/listeners/{id}",
             get(get_listener).patch(update_listener).delete(delete_listener),
         )
         .route("/api/v1/routes", post(create_route).get(list_routes))
         .route(
-            "/api/v1/routes/:id",
+            "/api/v1/routes/{id}",
             get(get_route).patch(update_route).delete(delete_route),
         )
         .route("/api/v1/upstreams", post(create_pool).get(list_pools))
         .route(
-            "/api/v1/upstreams/:id",
+            "/api/v1/upstreams/{id}",
             get(get_pool).patch(update_pool).delete(delete_pool),
         )
         .route(
-            "/api/v1/upstreams/:id/targets",
+            "/api/v1/upstreams/{id}/targets",
             post(create_target),
         )
         .route(
-            "/api/v1/targets/:id",
+            "/api/v1/targets/{id}",
             patch(update_target).delete(delete_target),
         )
         .route("/api/v1/targets", get(list_targets))
         .route("/api/v1/tls/policies", post(create_tls_policy).get(list_tls))
         .route(
-            "/api/v1/tls/policies/:id",
+            "/api/v1/tls/policies/{id}",
             patch(update_tls_policy),
         )
         .route("/api/v1/certificates/renew", post(renew_certificate))
@@ -69,12 +69,12 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/api/v1/config/publish", post(publish_config))
         .route("/api/v1/config/rollback", post(rollback_config))
         .route("/api/v1/config/versions", get(list_versions))
-        .route("/api/v1/config/versions/:id", get(get_version))
+        .route("/api/v1/config/versions/{id}", get(get_version))
         .route("/api/v1/config/published", get(get_published_snapshot))
         .route("/api/v1/nodes/register", post(register_node))
         .route("/api/v1/nodes/heartbeat", post(heartbeat_node))
         .route("/api/v1/nodes", get(list_nodes))
-        .route("/api/v1/acme/challenge/:token", get(get_acme_challenge))
+        .route("/api/v1/acme/challenge/{token}", get(get_acme_challenge))
         .route("/api/v1/audit", get(list_audit))
         .route("/api/v1/metrics", get(metrics))
         .fallback_service(static_files)
@@ -716,6 +716,45 @@ fn validate_listener(
                 listener.id
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use gateway_common::snapshot::Snapshot;
+    use gateway_common::state::SnapshotStore;
+    use sea_orm::DatabaseConnection;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn acme_challenge_route_uses_brace_params() {
+        let (snapshots, _rx) = SnapshotStore::new(Snapshot::default());
+        let state = AppState {
+            db: DatabaseConnection::default(),
+            snapshots,
+            acme_store: crate::acme::AcmeChallengeStore::default(),
+        };
+
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/acme/challenge/test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("error").is_some());
     }
 }
 

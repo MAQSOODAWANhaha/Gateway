@@ -22,3 +22,6 @@ serde_json = { workspace = true }
 
 gateway-common = { path = "../common" }
 gateway-migration = { path = "../migration" }
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
