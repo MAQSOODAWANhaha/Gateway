@@ -8972,3 +8972,5 @@ web/node_modules/zod/v4-mini/index.d.cts
 web/node_modules/zod/v4-mini/index.d.ts
 web/node_modules/zod/v4-mini/index.js
 web/node_modules/zod/v4-mini/package.json
+
+.env

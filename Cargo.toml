@@ -17,6 +17,7 @@ async-trait = "0.1.89"
 axum = "0.8.8"
 bytes = "1.10.1"
 chrono = { version = "0.4.43", features = ["serde"] }
+dotenvy = "0.15.7"
 instant-acme = "0.8.4"
 pingora = { version = "0.6.0", features = ["proxy"] }
 regex = "1.12.2"

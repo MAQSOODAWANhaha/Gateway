@@ -23,6 +23,8 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
+        // Load .env early so process env reads pick it up.
+        let _ = dotenvy::dotenv();
         let run_control_plane = env_bool("RUN_CONTROL_PLANE", true);
         let run_data_plane = env_bool("RUN_DATA_PLANE", true);
 
