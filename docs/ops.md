@@ -49,6 +49,12 @@
 - 所有数据平面节点配置相同 `CONTROL_PLANE_URL`，各自设置唯一 `NODE_ID`。
 - 发布后节点通过轮询更新快照，心跳写回节点状态。
 
+### Docker 镜像运行（可选）
+- 仓库提供 `deploy/Dockerfile`，构建出的镜像同时包含 `gateway-control-plane` 与 `gateway-data-plane`。
+- 通过环境变量开关控制进程：`RUN_CONTROL_PLANE=true|false`、`RUN_DATA_PLANE=true|false`。
+- 示例（只跑控制平面）：`RUN_DATA_PLANE=false`，并确保设置 `DATABASE_URL`。
+- 示例（只跑数据平面）：`RUN_CONTROL_PLANE=false`，并确保设置 `CONTROL_PLANE_URL`（指向控制平面）。
+
 ## 发布与回滚
 - 发布：先调用 `/api/v1/config/validate`，再调用 `/api/v1/config/publish`。
 - 回滚：调用 `/api/v1/config/rollback` 并指定 `version_id`。
