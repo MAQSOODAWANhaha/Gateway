@@ -58,6 +58,11 @@ impl GatewayError {
         Self::NotFound(resource.into())
     }
 
+    /// 创建请求参数错误
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self::BadRequest(msg.into())
+    }
+
     /// 创建验证错误
     pub fn validation(msg: impl Into<String>) -> Self {
         Self::Validation(msg.into())
@@ -234,6 +239,28 @@ where
     }
 }
 
+// ============ Pingora 错误支持 ============
+
+#[cfg(feature = "data-plane")]
+mod pingora_impl {
+    use super::*;
+
+    /// 为 Pingora 错误实现 From trait
+    /// 允许在 data-plane 中直接将 Pingora 错误转换为 GatewayError
+    impl From<pingora::Error> for GatewayError {
+        fn from(err: pingora::Error) -> Self {
+            Self::Pingora(err.to_string())
+        }
+    }
+
+    /// 为 boxed Pingora 错误实现 From trait
+    impl From<Box<pingora::Error>> for GatewayError {
+        fn from(err: Box<pingora::Error>) -> Self {
+            Self::Pingora(err.to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +309,10 @@ mod tests {
         let err = GatewayError::not_found("listener 123");
         assert!(matches!(err, GatewayError::NotFound(_)));
         assert_eq!(err.to_string(), "资源未找到: listener 123");
+
+        let err = GatewayError::bad_request("invalid parameter");
+        assert!(matches!(err, GatewayError::BadRequest(_)));
+        assert_eq!(err.to_string(), "请求参数错误: invalid parameter");
 
         let err = GatewayError::validation("invalid port");
         assert!(matches!(err, GatewayError::Validation(_)));

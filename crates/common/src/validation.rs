@@ -492,7 +492,7 @@ mod tests {
         let errors = ctx.validate_snapshot(&snapshot);
 
         // 会有 duplicate listener 错误，同时也有 duplicate port 错误
-        assert!(errors.len() >= 1);
+        assert!(!errors.is_empty());
         assert!(
             errors
                 .iter()
@@ -515,7 +515,7 @@ mod tests {
         let errors = ctx.validate_snapshot(&snapshot);
 
         // 应该有两个错误：duplicate listener (protocol+port) 和 duplicate port
-        assert!(errors.len() >= 1);
+        assert!(!errors.is_empty());
         assert!(
             errors
                 .iter()
@@ -539,7 +539,7 @@ mod tests {
 
         // 应该检测到重复（协议不区分大小写）
         // 会有 duplicate listener 和 duplicate port 两个错误
-        assert!(errors.len() >= 1);
+        assert!(!errors.is_empty());
         assert!(
             errors
                 .iter()

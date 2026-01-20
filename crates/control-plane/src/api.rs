@@ -18,7 +18,6 @@ use gateway_common::snapshot::{PublishedSnapshotResponse, Snapshot, build_snapsh
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
-    TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -170,35 +169,39 @@ async fn update_listener(
 ) -> Result<Json<ListenerModel>> {
     let actor = actor_from_headers(&headers);
 
-    let (updated, audit_diff) = txn_with!(&state.db, |txn, payload| {
-        let listener = listeners::Entity::find_by_id(id)
-            .one(txn)
-            .await?
-            .ok_or_else(|| GatewayError::NotFound("listener not found".to_string()))?;
+    let (updated, audit_diff) = txn_with!(
+        &state.db,
+        |txn, payload| {
+            let listener = listeners::Entity::find_by_id(id)
+                .one(txn)
+                .await?
+                .ok_or_else(|| GatewayError::NotFound("listener not found".to_string()))?;
 
-        let before = listener.clone();
-        let mut active: listeners::ActiveModel = listener.into();
-        if let Some(name) = payload.name {
-            active.name = Set(name);
-        }
-        if let Some(port) = payload.port {
-            active.port = Set(port);
-        }
-        if let Some(protocol) = payload.protocol {
-            active.protocol = Set(protocol);
-        }
-        if let Some(tls_policy_id) = payload.tls_policy_id {
-            active.tls_policy_id = Set(Some(tls_policy_id));
-        }
-        if let Some(enabled) = payload.enabled {
-            active.enabled = Set(enabled);
-        }
-        active.updated_at = Set(Utc::now().into());
+            let before = listener.clone();
+            let mut active: listeners::ActiveModel = listener.into();
+            if let Some(name) = payload.name {
+                active.name = Set(name);
+            }
+            if let Some(port) = payload.port {
+                active.port = Set(port);
+            }
+            if let Some(protocol) = payload.protocol {
+                active.protocol = Set(protocol);
+            }
+            if let Some(tls_policy_id) = payload.tls_policy_id {
+                active.tls_policy_id = Set(Some(tls_policy_id));
+            }
+            if let Some(enabled) = payload.enabled {
+                active.enabled = Set(enabled);
+            }
+            active.updated_at = Set(Utc::now().into());
 
-        let updated = active.update(txn).await?;
-        let diff = json!({"before": before, "after": updated});
-        Ok::<(ListenerModel, serde_json::Value), GatewayError>((updated, diff))
-    }, &payload)?;
+            let updated = active.update(txn).await?;
+            let diff = json!({"before": before, "after": updated});
+            Ok::<_, anyhow::Error>((updated, diff))
+        },
+        &payload
+    )?;
 
     spawn_audit(
         state.db.clone(),
@@ -244,25 +247,20 @@ async fn create_route(
     let priority = payload.priority;
     let upstream_pool_id = payload.upstream_pool_id;
 
-    let route = state
-        .db
-        .transaction(|txn| {
-            Box::pin(async move {
-                let active = routes::ActiveModel {
-                    id: Set(Uuid::new_v4()),
-                    listener_id: Set(listener_id),
-                    r#type: Set(r#type),
-                    match_expr: Set(match_expr),
-                    priority: Set(priority),
-                    upstream_pool_id: Set(upstream_pool_id),
-                    enabled: Set(enabled),
-                    ..Default::default()
-                };
-                let route = active.insert(txn).await?;
-                Ok::<_, anyhow::Error>(route)
-            })
-        })
-        .await?;
+    let route = txn!(&state.db, |txn| {
+        let active = routes::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            listener_id: Set(listener_id),
+            r#type: Set(r#type),
+            match_expr: Set(match_expr),
+            priority: Set(priority),
+            upstream_pool_id: Set(upstream_pool_id),
+            enabled: Set(enabled),
+            ..Default::default()
+        };
+        let route = active.insert(txn).await?;
+        Ok::<_, anyhow::Error>(route)
+    })?;
 
     spawn_audit(
         state.db.clone(),
@@ -304,41 +302,39 @@ async fn update_route(
     Json(payload): Json<UpdateRoute>,
 ) -> Result<Json<RouteModel>> {
     let actor = actor_from_headers(&headers);
-    let (updated, audit_diff) = state
-        .db
-        .transaction(|txn| {
-            let payload = payload.clone();
-            Box::pin(async move {
-                let route = routes::Entity::find_by_id(id)
-                    .one(txn)
-                    .await?
-                    .ok_or_else(|| GatewayError::NotFound("route not found".to_string()))?;
+    let (updated, audit_diff) = txn_with!(
+        &state.db,
+        |txn, payload| {
+            let route = routes::Entity::find_by_id(id)
+                .one(txn)
+                .await?
+                .ok_or_else(|| GatewayError::NotFound("route not found".to_string()))?;
 
-                let before = route.clone();
-                let mut active: routes::ActiveModel = route.into();
-                if let Some(r#type) = payload.r#type {
-                    active.r#type = Set(r#type);
-                }
-                if let Some(match_expr) = payload.match_expr {
-                    active.match_expr = Set(match_expr);
-                }
-                if let Some(priority) = payload.priority {
-                    active.priority = Set(priority);
-                }
-                if let Some(upstream_pool_id) = payload.upstream_pool_id {
-                    active.upstream_pool_id = Set(upstream_pool_id);
-                }
-                if let Some(enabled) = payload.enabled {
-                    active.enabled = Set(enabled);
-                }
-                active.updated_at = Set(Utc::now().into());
+            let before = route.clone();
+            let mut active: routes::ActiveModel = route.into();
+            if let Some(r#type) = payload.r#type {
+                active.r#type = Set(r#type);
+            }
+            if let Some(match_expr) = payload.match_expr {
+                active.match_expr = Set(match_expr);
+            }
+            if let Some(priority) = payload.priority {
+                active.priority = Set(priority);
+            }
+            if let Some(upstream_pool_id) = payload.upstream_pool_id {
+                active.upstream_pool_id = Set(upstream_pool_id);
+            }
+            if let Some(enabled) = payload.enabled {
+                active.enabled = Set(enabled);
+            }
+            active.updated_at = Set(Utc::now().into());
 
-                let updated = active.update(txn).await?;
-                let diff = json!({"before": before, "after": updated});
-                Ok::<_, anyhow::Error>((updated, diff))
-            })
-        })
-        .await?;
+            let updated = active.update(txn).await?;
+            let diff = json!({"before": before, "after": updated});
+            Ok::<_, anyhow::Error>((updated, diff))
+        },
+        &payload
+    )?;
 
     spawn_audit(
         state.db.clone(),
@@ -356,16 +352,11 @@ async fn delete_route(
     Path(id): Path<Uuid>,
 ) -> Result<Json<JsonValue>> {
     let actor = actor_from_headers(&headers);
-    let before = state
-        .db
-        .transaction(|txn| {
-            Box::pin(async move {
-                let before = routes::Entity::find_by_id(id).one(txn).await?;
-                routes::Entity::delete_by_id(id).exec(txn).await?;
-                Ok::<_, anyhow::Error>(before)
-            })
-        })
-        .await?;
+    let before = txn!(&state.db, |txn| {
+        let before = routes::Entity::find_by_id(id).one(txn).await?;
+        routes::Entity::delete_by_id(id).exec(txn).await?;
+        Ok::<_, anyhow::Error>(before)
+    })?;
 
     spawn_audit(
         state.db.clone(),
@@ -387,22 +378,17 @@ async fn create_pool(
     let policy = payload.policy;
     let health_check = payload.health_check;
 
-    let pool = state
-        .db
-        .transaction(|txn| {
-            Box::pin(async move {
-                let active = upstream_pools::ActiveModel {
-                    id: Set(Uuid::new_v4()),
-                    name: Set(name),
-                    policy: Set(policy),
-                    health_check: Set(health_check),
-                    ..Default::default()
-                };
-                let pool = active.insert(txn).await?;
-                Ok::<_, anyhow::Error>(pool)
-            })
-        })
-        .await?;
+    let pool = txn!(&state.db, |txn| {
+        let active = upstream_pools::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            name: Set(name),
+            policy: Set(policy),
+            health_check: Set(health_check),
+            ..Default::default()
+        };
+        let pool = active.insert(txn).await?;
+        Ok::<_, anyhow::Error>(pool)
+    })?;
 
     spawn_audit(
         state.db.clone(),
@@ -437,35 +423,33 @@ async fn update_pool(
     Json(payload): Json<UpdateUpstreamPool>,
 ) -> Result<Json<UpstreamPoolModel>> {
     let actor = actor_from_headers(&headers);
-    let (updated, audit_diff) = state
-        .db
-        .transaction(|txn| {
-            let payload = payload.clone();
-            Box::pin(async move {
-                let pool = upstream_pools::Entity::find_by_id(id)
-                    .one(txn)
-                    .await?
-                    .ok_or_else(|| GatewayError::NotFound("upstream pool not found".to_string()))?;
+    let (updated, audit_diff) = txn_with!(
+        &state.db,
+        |txn, payload| {
+            let pool = upstream_pools::Entity::find_by_id(id)
+                .one(txn)
+                .await?
+                .ok_or_else(|| GatewayError::NotFound("upstream pool not found".to_string()))?;
 
-                let before = pool.clone();
-                let mut active: upstream_pools::ActiveModel = pool.into();
-                if let Some(name) = payload.name {
-                    active.name = Set(name);
-                }
-                if let Some(policy) = payload.policy {
-                    active.policy = Set(policy);
-                }
-                if let Some(health_check) = payload.health_check {
-                    active.health_check = Set(Some(health_check));
-                }
-                active.updated_at = Set(Utc::now().into());
+            let before = pool.clone();
+            let mut active: upstream_pools::ActiveModel = pool.into();
+            if let Some(name) = payload.name {
+                active.name = Set(name);
+            }
+            if let Some(policy) = payload.policy {
+                active.policy = Set(policy);
+            }
+            if let Some(health_check) = payload.health_check {
+                active.health_check = Set(Some(health_check));
+            }
+            active.updated_at = Set(Utc::now().into());
 
-                let updated = active.update(txn).await?;
-                let diff = json!({"before": before, "after": updated});
-                Ok::<_, anyhow::Error>((updated, diff))
-            })
-        })
-        .await?;
+            let updated = active.update(txn).await?;
+            let diff = json!({"before": before, "after": updated});
+            Ok::<_, anyhow::Error>((updated, diff))
+        },
+        &payload
+    )?;
 
     spawn_audit(
         state.db.clone(),
@@ -483,16 +467,11 @@ async fn delete_pool(
     Path(id): Path<Uuid>,
 ) -> Result<Json<JsonValue>> {
     let actor = actor_from_headers(&headers);
-    let before = state
-        .db
-        .transaction(|txn| {
-            Box::pin(async move {
-                let before = upstream_pools::Entity::find_by_id(id).one(txn).await?;
-                upstream_pools::Entity::delete_by_id(id).exec(txn).await?;
-                Ok::<_, anyhow::Error>(before)
-            })
-        })
-        .await?;
+    let before = txn!(&state.db, |txn| {
+        let before = upstream_pools::Entity::find_by_id(id).one(txn).await?;
+        upstream_pools::Entity::delete_by_id(id).exec(txn).await?;
+        Ok::<_, anyhow::Error>(before)
+    })?;
 
     spawn_audit(
         state.db.clone(),
@@ -515,23 +494,18 @@ async fn create_target(
     let enabled = payload.enabled.unwrap_or(true);
     let address = payload.address;
 
-    let target = state
-        .db
-        .transaction(|txn| {
-            Box::pin(async move {
-                let active = upstream_targets::ActiveModel {
-                    id: Set(Uuid::new_v4()),
-                    pool_id: Set(id),
-                    address: Set(address),
-                    weight: Set(weight),
-                    enabled: Set(enabled),
-                    ..Default::default()
-                };
-                let target = active.insert(txn).await?;
-                Ok::<_, anyhow::Error>(target)
-            })
-        })
-        .await?;
+    let target = txn!(&state.db, |txn| {
+        let active = upstream_targets::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            pool_id: Set(id),
+            address: Set(address),
+            weight: Set(weight),
+            enabled: Set(enabled),
+            ..Default::default()
+        };
+        let target = active.insert(txn).await?;
+        Ok::<_, anyhow::Error>(target)
+    })?;
 
     spawn_audit(
         state.db.clone(),
@@ -550,37 +524,33 @@ async fn update_target(
     Json(payload): Json<UpdateUpstreamTarget>,
 ) -> Result<Json<UpstreamTargetModel>> {
     let actor = actor_from_headers(&headers);
-    let (updated, audit_diff) = state
-        .db
-        .transaction(|txn| {
-            let payload = payload.clone();
-            Box::pin(async move {
-                let target = upstream_targets::Entity::find_by_id(id)
-                    .one(txn)
-                    .await?
-                    .ok_or_else(|| {
-                        GatewayError::NotFound("upstream target not found".to_string())
-                    })?;
+    let (updated, audit_diff) = txn_with!(
+        &state.db,
+        |txn, payload| {
+            let target = upstream_targets::Entity::find_by_id(id)
+                .one(txn)
+                .await?
+                .ok_or_else(|| GatewayError::NotFound("upstream target not found".to_string()))?;
 
-                let before = target.clone();
-                let mut active: upstream_targets::ActiveModel = target.into();
-                if let Some(address) = payload.address {
-                    active.address = Set(address);
-                }
-                if let Some(weight) = payload.weight {
-                    active.weight = Set(weight);
-                }
-                if let Some(enabled) = payload.enabled {
-                    active.enabled = Set(enabled);
-                }
-                active.updated_at = Set(Utc::now().into());
+            let before = target.clone();
+            let mut active: upstream_targets::ActiveModel = target.into();
+            if let Some(address) = payload.address {
+                active.address = Set(address);
+            }
+            if let Some(weight) = payload.weight {
+                active.weight = Set(weight);
+            }
+            if let Some(enabled) = payload.enabled {
+                active.enabled = Set(enabled);
+            }
+            active.updated_at = Set(Utc::now().into());
 
-                let updated = active.update(txn).await?;
-                let diff = json!({"before": before, "after": updated});
-                Ok::<_, anyhow::Error>((updated, diff))
-            })
-        })
-        .await?;
+            let updated = active.update(txn).await?;
+            let diff = json!({"before": before, "after": updated});
+            Ok::<_, anyhow::Error>((updated, diff))
+        },
+        &payload
+    )?;
 
     spawn_audit(
         state.db.clone(),
@@ -598,16 +568,11 @@ async fn delete_target(
     Path(id): Path<Uuid>,
 ) -> Result<Json<JsonValue>> {
     let actor = actor_from_headers(&headers);
-    let before = state
-        .db
-        .transaction(|txn| {
-            Box::pin(async move {
-                let before = upstream_targets::Entity::find_by_id(id).one(txn).await?;
-                upstream_targets::Entity::delete_by_id(id).exec(txn).await?;
-                Ok::<_, anyhow::Error>(before)
-            })
-        })
-        .await?;
+    let before = txn!(&state.db, |txn| {
+        let before = upstream_targets::Entity::find_by_id(id).one(txn).await?;
+        upstream_targets::Entity::delete_by_id(id).exec(txn).await?;
+        Ok::<_, anyhow::Error>(before)
+    })?;
 
     spawn_audit(
         state.db.clone(),
@@ -645,22 +610,17 @@ async fn create_tls_policy(
     let mode = payload.mode;
     let domains = payload.domains;
 
-    let tls = state
-        .db
-        .transaction(|txn| {
-            Box::pin(async move {
-                let active = tls_policies::ActiveModel {
-                    id: Set(Uuid::new_v4()),
-                    mode: Set(mode),
-                    domains: Set(domains),
-                    status: Set("pending".to_string()),
-                    ..Default::default()
-                };
-                let tls = active.insert(txn).await?;
-                Ok::<_, anyhow::Error>(tls)
-            })
-        })
-        .await?;
+    let tls = txn!(&state.db, |txn| {
+        let active = tls_policies::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            mode: Set(mode),
+            domains: Set(domains),
+            status: Set("pending".to_string()),
+            ..Default::default()
+        };
+        let tls = active.insert(txn).await?;
+        Ok::<_, anyhow::Error>(tls)
+    })?;
 
     spawn_audit(
         state.db.clone(),
@@ -684,35 +644,33 @@ async fn update_tls_policy(
     Json(payload): Json<UpdateTlsPolicy>,
 ) -> Result<Json<TlsPolicyModel>> {
     let actor = actor_from_headers(&headers);
-    let (updated, audit_diff) = state
-        .db
-        .transaction(|txn| {
-            let payload = payload.clone();
-            Box::pin(async move {
-                let tls = tls_policies::Entity::find_by_id(id)
-                    .one(txn)
-                    .await?
-                    .ok_or_else(|| GatewayError::NotFound("tls policy not found".to_string()))?;
+    let (updated, audit_diff) = txn_with!(
+        &state.db,
+        |txn, payload| {
+            let tls = tls_policies::Entity::find_by_id(id)
+                .one(txn)
+                .await?
+                .ok_or_else(|| GatewayError::NotFound("tls policy not found".to_string()))?;
 
-                let before = tls.clone();
-                let mut active: tls_policies::ActiveModel = tls.into();
-                if let Some(mode) = payload.mode {
-                    active.mode = Set(mode);
-                }
-                if let Some(domains) = payload.domains {
-                    active.domains = Set(domains);
-                }
-                if let Some(status) = payload.status {
-                    active.status = Set(status);
-                }
-                active.updated_at = Set(Utc::now().into());
+            let before = tls.clone();
+            let mut active: tls_policies::ActiveModel = tls.into();
+            if let Some(mode) = payload.mode {
+                active.mode = Set(mode);
+            }
+            if let Some(domains) = payload.domains {
+                active.domains = Set(domains);
+            }
+            if let Some(status) = payload.status {
+                active.status = Set(status);
+            }
+            active.updated_at = Set(Utc::now().into());
 
-                let updated = active.update(txn).await?;
-                let diff = json!({"before": before, "after": updated});
-                Ok::<_, anyhow::Error>((updated, diff))
-            })
-        })
-        .await?;
+            let updated = active.update(txn).await?;
+            let diff = json!({"before": before, "after": updated});
+            Ok::<_, anyhow::Error>((updated, diff))
+        },
+        &payload
+    )?;
 
     spawn_audit(
         state.db.clone(),
@@ -729,19 +687,14 @@ async fn renew_certificate(
     State(state): State<AppState>,
 ) -> Result<Json<JsonValue>> {
     let actor = actor_from_headers(&headers);
-    state
-        .db
-        .transaction(|txn| {
-            Box::pin(async move {
-                tls_policies::Entity::update_many()
-                    .col_expr(tls_policies::Column::Status, Expr::value("pending"))
-                    .filter(tls_policies::Column::Mode.eq("auto"))
-                    .exec(txn)
-                    .await?;
-                Ok::<_, anyhow::Error>(())
-            })
-        })
-        .await?;
+    txn!(&state.db, |txn| {
+        tls_policies::Entity::update_many()
+            .col_expr(tls_policies::Column::Status, Expr::value("pending"))
+            .filter(tls_policies::Column::Mode.eq("auto"))
+            .exec(txn)
+            .await?;
+        Ok::<_, anyhow::Error>(())
+    })?;
 
     spawn_audit(
         state.db.clone(),
@@ -809,31 +762,28 @@ async fn publish_config(
     let snapshot_json = serde_json::to_value(&snapshot)?;
 
     let actor = payload.actor.clone();
-    let actor_for_txn = actor.clone();
-    let version = state
-        .db
-        .transaction(|txn| {
-            let actor = actor_for_txn.clone();
-            let snapshot_json = snapshot_json.clone();
-            Box::pin(async move {
-                config_versions::Entity::update_many()
-                    .col_expr(config_versions::Column::Status, Expr::value("archived"))
-                    .filter(config_versions::Column::Status.eq("published"))
-                    .exec(txn)
-                    .await?;
+    let version = txn_with!(
+        &state.db,
+        |txn, actor, snapshot_json| {
+            config_versions::Entity::update_many()
+                .col_expr(config_versions::Column::Status, Expr::value("archived"))
+                .filter(config_versions::Column::Status.eq("published"))
+                .exec(txn)
+                .await?;
 
-                let active = config_versions::ActiveModel {
-                    id: Set(Uuid::new_v4()),
-                    snapshot_json: Set(snapshot_json),
-                    status: Set("published".to_string()),
-                    created_by: Set(actor.clone()),
-                    ..Default::default()
-                };
-                let version = active.insert(txn).await?;
-                Ok::<_, anyhow::Error>(version)
-            })
-        })
-        .await?;
+            let active = config_versions::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                snapshot_json: Set(snapshot_json),
+                status: Set("published".to_string()),
+                created_by: Set(actor.clone()),
+                ..Default::default()
+            };
+            let version = active.insert(txn).await?;
+            Ok::<_, anyhow::Error>(version)
+        },
+        &actor,
+        &snapshot_json
+    )?;
 
     state.snapshots.apply(snapshot).await?;
 
@@ -853,31 +803,24 @@ async fn rollback_config(
     let version_id = payload.version_id;
     let actor = payload.actor.clone();
 
-    let version = state
-        .db
-        .transaction(|txn| {
-            Box::pin(async move {
-                let version = config_versions::Entity::find_by_id(version_id)
-                    .one(txn)
-                    .await?
-                    .ok_or_else(|| {
-                        GatewayError::NotFound("config version not found".to_string())
-                    })?;
+    let version = txn!(&state.db, |txn| {
+        let version = config_versions::Entity::find_by_id(version_id)
+            .one(txn)
+            .await?
+            .ok_or_else(|| GatewayError::NotFound("config version not found".to_string()))?;
 
-                config_versions::Entity::update_many()
-                    .col_expr(config_versions::Column::Status, Expr::value("archived"))
-                    .filter(config_versions::Column::Status.eq("published"))
-                    .exec(txn)
-                    .await?;
-                config_versions::Entity::update_many()
-                    .col_expr(config_versions::Column::Status, Expr::value("published"))
-                    .filter(config_versions::Column::Id.eq(version_id))
-                    .exec(txn)
-                    .await?;
-                Ok::<_, anyhow::Error>(version)
-            })
-        })
-        .await?;
+        config_versions::Entity::update_many()
+            .col_expr(config_versions::Column::Status, Expr::value("archived"))
+            .filter(config_versions::Column::Status.eq("published"))
+            .exec(txn)
+            .await?;
+        config_versions::Entity::update_many()
+            .col_expr(config_versions::Column::Status, Expr::value("published"))
+            .filter(config_versions::Column::Id.eq(version_id))
+            .exec(txn)
+            .await?;
+        Ok::<_, anyhow::Error>(version)
+    })?;
 
     let snapshot: Snapshot = serde_json::from_value(version.snapshot_json.clone())?;
     state.snapshots.apply(snapshot).await?;
