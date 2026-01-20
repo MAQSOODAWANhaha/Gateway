@@ -44,6 +44,7 @@ pub async fn run_acme_worker(
 ) -> Result<()> {
     if !config.acme_enabled {
         info!("ACME disabled, skipping worker");
+        std::future::pending::<()>().await;
         return Ok(());
     }
 
