@@ -1,5 +1,5 @@
 use crate::tls::TlsKeyPairPem;
-use anyhow::Result as AnyResult;
+use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use gateway_common::config::PortRange;
@@ -58,7 +58,11 @@ impl ProxyHttp for ProxyRouter {
         }
     }
 
-    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> Result<bool, Box<pingora::Error>> {
         ctx.start = Instant::now();
         crate::metrics::inflight_inc();
 
@@ -97,7 +101,7 @@ impl ProxyHttp for ProxyRouter {
         &self,
         session: &mut Session,
         ctx: &mut Self::CTX,
-    ) -> Result<Box<HttpPeer>> {
+    ) -> Result<Box<HttpPeer>, Box<pingora::Error>> {
         let header = session.req_header();
         let port = session
             .as_downstream()
@@ -516,7 +520,7 @@ pub fn build_runtime(
     default_tls_pem: &TlsKeyPairPem,
     http_port_range: Option<PortRange>,
     https_port_range: Option<PortRange>,
-) -> AnyResult<RuntimeConfig> {
+) -> Result<RuntimeConfig> {
     let mut pools = HashMap::new();
     for pool in &snapshot.upstream_pools {
         let targets: Vec<Arc<TargetRuntime>> = snapshot
@@ -754,13 +758,13 @@ pub async fn apply_snapshot(
     default_tls_pem: &TlsKeyPairPem,
     http_port_range: Option<PortRange>,
     https_port_range: Option<PortRange>,
-) -> AnyResult<()> {
+) -> Result<()> {
     let new_runtime = build_runtime(snapshot, default_tls_pem, http_port_range, https_port_range)?;
     *runtime.write().await = new_runtime;
     Ok(())
 }
 
-fn parse_tls_keypair(pem: &TlsKeyPairPem) -> AnyResult<TlsKeyPair> {
+fn parse_tls_keypair(pem: &TlsKeyPairPem) -> Result<TlsKeyPair> {
     let chain = pingora::tls::x509::X509::stack_from_pem(&pem.cert_pem)?;
     let mut iter = chain.into_iter();
     let leaf = iter

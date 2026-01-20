@@ -3,6 +3,11 @@ name = "gateway-common"
 edition = { workspace = true }
 version = { workspace = true }
 
+[features]
+default = []
+control-plane = ["axum"]
+data-plane = []
+
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true }
@@ -10,5 +15,10 @@ dotenvy = { workspace = true }
 sea-orm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }
+
+# 可选依赖（按需启用）
+axum = { workspace = true, optional = true }

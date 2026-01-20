@@ -22,7 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 prometheus = { workspace = true }
 
-gateway-common = { path = "../common" }
+gateway-common = { path = "../common", features = ["control-plane"] }
 gateway-migration = { path = "../migration" }
 
 [dev-dependencies]

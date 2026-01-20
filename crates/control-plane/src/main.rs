@@ -1,9 +1,9 @@
 mod acme;
 mod api;
 mod db;
-mod error;
 mod metrics;
 mod state;
+mod transaction;
 
 use crate::acme::AcmeChallengeStore;
 use crate::db::init_db;

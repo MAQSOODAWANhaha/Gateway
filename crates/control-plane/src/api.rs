@@ -1,5 +1,9 @@
-use crate::error::AppError;
 use crate::state::AppState;
+use gateway_common::{GatewayError, Result};
+
+// 导入事务辅助宏
+use crate::{txn, txn_with};
+
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -23,8 +27,6 @@ use tower::ServiceBuilder;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
-
-type ApiResult<T> = std::result::Result<T, AppError>;
 
 type ListenerModel = listeners::Model;
 type RouteModel = routes::Model;
@@ -110,7 +112,7 @@ async fn create_listener(
     headers: HeaderMap,
     State(state): State<AppState>,
     Json(payload): Json<CreateListener>,
-) -> ApiResult<Json<ListenerModel>> {
+) -> Result<Json<ListenerModel>> {
     let actor = actor_from_headers(&headers);
     let enabled = payload.enabled.unwrap_or(true);
     let name = payload.name;
@@ -118,25 +120,18 @@ async fn create_listener(
     let protocol = payload.protocol;
     let tls_policy_id = payload.tls_policy_id;
 
-    let listener = state
-        .db
-        .transaction(|txn| {
-            Box::pin(async move {
-                let active = listeners::ActiveModel {
-                    id: Set(Uuid::new_v4()),
-                    name: Set(name),
-                    port: Set(port),
-                    protocol: Set(protocol),
-                    tls_policy_id: Set(tls_policy_id),
-                    enabled: Set(enabled),
-                    ..Default::default()
-                };
-                let listener = active.insert(txn).await?;
-                Ok::<_, AppError>(listener)
-            })
-        })
-        .await
-        .map_err(AppError::from)?;
+    let listener = txn!(&state.db, |txn| {
+        let active = listeners::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            name: Set(name),
+            port: Set(port),
+            protocol: Set(protocol),
+            tls_policy_id: Set(tls_policy_id),
+            enabled: Set(enabled),
+            ..Default::default()
+        };
+        Ok::<_, GatewayError>(active.insert(txn).await?)
+    })?;
 
     spawn_audit(
         state.db.clone(),
@@ -148,7 +143,7 @@ async fn create_listener(
     Ok(Json(listener))
 }
 
-async fn list_listeners(State(state): State<AppState>) -> ApiResult<Json<Vec<ListenerModel>>> {
+async fn list_listeners(State(state): State<AppState>) -> Result<Json<Vec<ListenerModel>>> {
     let list = listeners::Entity::find()
         .order_by_asc(listeners::Column::CreatedAt)
         .all(&state.db)
@@ -159,11 +154,11 @@ async fn list_listeners(State(state): State<AppState>) -> ApiResult<Json<Vec<Lis
 async fn get_listener(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<ListenerModel>> {
+) -> Result<Json<ListenerModel>> {
     let listener = listeners::Entity::find_by_id(id)
         .one(&state.db)
         .await?
-        .ok_or_else(|| AppError::NotFound("listener not found".to_string()))?;
+        .ok_or_else(|| GatewayError::NotFound("listener not found".to_string()))?;
     Ok(Json(listener))
 }
 
@@ -172,45 +167,38 @@ async fn update_listener(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateListener>,
-) -> ApiResult<Json<ListenerModel>> {
+) -> Result<Json<ListenerModel>> {
     let actor = actor_from_headers(&headers);
 
-    let (updated, audit_diff) = state
-        .db
-        .transaction(|txn| {
-            let payload = payload.clone();
-            Box::pin(async move {
-                let listener = listeners::Entity::find_by_id(id)
-                    .one(txn)
-                    .await?
-                    .ok_or_else(|| AppError::NotFound("listener not found".to_string()))?;
+    let (updated, audit_diff) = txn_with!(&state.db, |txn, payload| {
+        let listener = listeners::Entity::find_by_id(id)
+            .one(txn)
+            .await?
+            .ok_or_else(|| GatewayError::NotFound("listener not found".to_string()))?;
 
-                let before = listener.clone();
-                let mut active: listeners::ActiveModel = listener.into();
-                if let Some(name) = payload.name {
-                    active.name = Set(name);
-                }
-                if let Some(port) = payload.port {
-                    active.port = Set(port);
-                }
-                if let Some(protocol) = payload.protocol {
-                    active.protocol = Set(protocol);
-                }
-                if let Some(tls_policy_id) = payload.tls_policy_id {
-                    active.tls_policy_id = Set(Some(tls_policy_id));
-                }
-                if let Some(enabled) = payload.enabled {
-                    active.enabled = Set(enabled);
-                }
-                active.updated_at = Set(Utc::now().into());
+        let before = listener.clone();
+        let mut active: listeners::ActiveModel = listener.into();
+        if let Some(name) = payload.name {
+            active.name = Set(name);
+        }
+        if let Some(port) = payload.port {
+            active.port = Set(port);
+        }
+        if let Some(protocol) = payload.protocol {
+            active.protocol = Set(protocol);
+        }
+        if let Some(tls_policy_id) = payload.tls_policy_id {
+            active.tls_policy_id = Set(Some(tls_policy_id));
+        }
+        if let Some(enabled) = payload.enabled {
+            active.enabled = Set(enabled);
+        }
+        active.updated_at = Set(Utc::now().into());
 
-                let updated = active.update(txn).await?;
-                let diff = json!({"before": before, "after": updated});
-                Ok::<_, AppError>((updated, diff))
-            })
-        })
-        .await
-        .map_err(AppError::from)?;
+        let updated = active.update(txn).await?;
+        let diff = json!({"before": before, "after": updated});
+        Ok::<(ListenerModel, serde_json::Value), GatewayError>((updated, diff))
+    }, &payload)?;
 
     spawn_audit(
         state.db.clone(),
@@ -226,19 +214,13 @@ async fn delete_listener(
     headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<JsonValue>> {
+) -> Result<Json<JsonValue>> {
     let actor = actor_from_headers(&headers);
-    let before = state
-        .db
-        .transaction(|txn| {
-            Box::pin(async move {
-                let before = listeners::Entity::find_by_id(id).one(txn).await?;
-                listeners::Entity::delete_by_id(id).exec(txn).await?;
-                Ok::<_, AppError>(before)
-            })
-        })
-        .await
-        .map_err(AppError::from)?;
+    let before = txn!(&state.db, |txn| {
+        let before = listeners::Entity::find_by_id(id).one(txn).await?;
+        listeners::Entity::delete_by_id(id).exec(txn).await?;
+        Ok::<_, GatewayError>(before)
+    })?;
 
     spawn_audit(
         state.db.clone(),
@@ -253,7 +235,7 @@ async fn create_route(
     headers: HeaderMap,
     State(state): State<AppState>,
     Json(payload): Json<CreateRoute>,
-) -> ApiResult<Json<RouteModel>> {
+) -> Result<Json<RouteModel>> {
     let actor = actor_from_headers(&headers);
     let enabled = payload.enabled.unwrap_or(true);
     let listener_id = payload.listener_id;
@@ -277,11 +259,10 @@ async fn create_route(
                     ..Default::default()
                 };
                 let route = active.insert(txn).await?;
-                Ok::<_, AppError>(route)
+                Ok::<_, anyhow::Error>(route)
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
     spawn_audit(
         state.db.clone(),
@@ -296,7 +277,7 @@ async fn create_route(
 async fn list_routes(
     State(state): State<AppState>,
     Query(params): Query<RouteListQuery>,
-) -> ApiResult<Json<Vec<RouteModel>>> {
+) -> Result<Json<Vec<RouteModel>>> {
     let mut query = routes::Entity::find().order_by_desc(routes::Column::Priority);
     if let Some(listener_id) = params.listener_id {
         query = query.filter(routes::Column::ListenerId.eq(listener_id));
@@ -308,11 +289,11 @@ async fn list_routes(
 async fn get_route(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<RouteModel>> {
+) -> Result<Json<RouteModel>> {
     let route = routes::Entity::find_by_id(id)
         .one(&state.db)
         .await?
-        .ok_or_else(|| AppError::NotFound("route not found".to_string()))?;
+        .ok_or_else(|| GatewayError::NotFound("route not found".to_string()))?;
     Ok(Json(route))
 }
 
@@ -321,7 +302,7 @@ async fn update_route(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateRoute>,
-) -> ApiResult<Json<RouteModel>> {
+) -> Result<Json<RouteModel>> {
     let actor = actor_from_headers(&headers);
     let (updated, audit_diff) = state
         .db
@@ -331,7 +312,7 @@ async fn update_route(
                 let route = routes::Entity::find_by_id(id)
                     .one(txn)
                     .await?
-                    .ok_or_else(|| AppError::NotFound("route not found".to_string()))?;
+                    .ok_or_else(|| GatewayError::NotFound("route not found".to_string()))?;
 
                 let before = route.clone();
                 let mut active: routes::ActiveModel = route.into();
@@ -354,11 +335,10 @@ async fn update_route(
 
                 let updated = active.update(txn).await?;
                 let diff = json!({"before": before, "after": updated});
-                Ok::<_, AppError>((updated, diff))
+                Ok::<_, anyhow::Error>((updated, diff))
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
     spawn_audit(
         state.db.clone(),
@@ -374,7 +354,7 @@ async fn delete_route(
     headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<JsonValue>> {
+) -> Result<Json<JsonValue>> {
     let actor = actor_from_headers(&headers);
     let before = state
         .db
@@ -382,11 +362,10 @@ async fn delete_route(
             Box::pin(async move {
                 let before = routes::Entity::find_by_id(id).one(txn).await?;
                 routes::Entity::delete_by_id(id).exec(txn).await?;
-                Ok::<_, AppError>(before)
+                Ok::<_, anyhow::Error>(before)
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
     spawn_audit(
         state.db.clone(),
@@ -402,7 +381,7 @@ async fn create_pool(
     headers: HeaderMap,
     State(state): State<AppState>,
     Json(payload): Json<CreateUpstreamPool>,
-) -> ApiResult<Json<UpstreamPoolModel>> {
+) -> Result<Json<UpstreamPoolModel>> {
     let actor = actor_from_headers(&headers);
     let name = payload.name;
     let policy = payload.policy;
@@ -420,11 +399,10 @@ async fn create_pool(
                     ..Default::default()
                 };
                 let pool = active.insert(txn).await?;
-                Ok::<_, AppError>(pool)
+                Ok::<_, anyhow::Error>(pool)
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
     spawn_audit(
         state.db.clone(),
@@ -436,7 +414,7 @@ async fn create_pool(
     Ok(Json(pool))
 }
 
-async fn list_pools(State(state): State<AppState>) -> ApiResult<Json<Vec<UpstreamPoolModel>>> {
+async fn list_pools(State(state): State<AppState>) -> Result<Json<Vec<UpstreamPoolModel>>> {
     let pools = upstream_pools::Entity::find().all(&state.db).await?;
     Ok(Json(pools))
 }
@@ -444,11 +422,11 @@ async fn list_pools(State(state): State<AppState>) -> ApiResult<Json<Vec<Upstrea
 async fn get_pool(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<UpstreamPoolModel>> {
+) -> Result<Json<UpstreamPoolModel>> {
     let pool = upstream_pools::Entity::find_by_id(id)
         .one(&state.db)
         .await?
-        .ok_or_else(|| AppError::NotFound("upstream pool not found".to_string()))?;
+        .ok_or_else(|| GatewayError::NotFound("upstream pool not found".to_string()))?;
     Ok(Json(pool))
 }
 
@@ -457,7 +435,7 @@ async fn update_pool(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateUpstreamPool>,
-) -> ApiResult<Json<UpstreamPoolModel>> {
+) -> Result<Json<UpstreamPoolModel>> {
     let actor = actor_from_headers(&headers);
     let (updated, audit_diff) = state
         .db
@@ -467,7 +445,7 @@ async fn update_pool(
                 let pool = upstream_pools::Entity::find_by_id(id)
                     .one(txn)
                     .await?
-                    .ok_or_else(|| AppError::NotFound("upstream pool not found".to_string()))?;
+                    .ok_or_else(|| GatewayError::NotFound("upstream pool not found".to_string()))?;
 
                 let before = pool.clone();
                 let mut active: upstream_pools::ActiveModel = pool.into();
@@ -484,11 +462,10 @@ async fn update_pool(
 
                 let updated = active.update(txn).await?;
                 let diff = json!({"before": before, "after": updated});
-                Ok::<_, AppError>((updated, diff))
+                Ok::<_, anyhow::Error>((updated, diff))
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
     spawn_audit(
         state.db.clone(),
@@ -504,7 +481,7 @@ async fn delete_pool(
     headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<JsonValue>> {
+) -> Result<Json<JsonValue>> {
     let actor = actor_from_headers(&headers);
     let before = state
         .db
@@ -512,11 +489,10 @@ async fn delete_pool(
             Box::pin(async move {
                 let before = upstream_pools::Entity::find_by_id(id).one(txn).await?;
                 upstream_pools::Entity::delete_by_id(id).exec(txn).await?;
-                Ok::<_, AppError>(before)
+                Ok::<_, anyhow::Error>(before)
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
     spawn_audit(
         state.db.clone(),
@@ -533,7 +509,7 @@ async fn create_target(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<CreateUpstreamTarget>,
-) -> ApiResult<Json<UpstreamTargetModel>> {
+) -> Result<Json<UpstreamTargetModel>> {
     let actor = actor_from_headers(&headers);
     let weight = payload.weight.unwrap_or(1);
     let enabled = payload.enabled.unwrap_or(true);
@@ -552,11 +528,10 @@ async fn create_target(
                     ..Default::default()
                 };
                 let target = active.insert(txn).await?;
-                Ok::<_, AppError>(target)
+                Ok::<_, anyhow::Error>(target)
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
     spawn_audit(
         state.db.clone(),
@@ -573,7 +548,7 @@ async fn update_target(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateUpstreamTarget>,
-) -> ApiResult<Json<UpstreamTargetModel>> {
+) -> Result<Json<UpstreamTargetModel>> {
     let actor = actor_from_headers(&headers);
     let (updated, audit_diff) = state
         .db
@@ -583,7 +558,9 @@ async fn update_target(
                 let target = upstream_targets::Entity::find_by_id(id)
                     .one(txn)
                     .await?
-                    .ok_or_else(|| AppError::NotFound("upstream target not found".to_string()))?;
+                    .ok_or_else(|| {
+                        GatewayError::NotFound("upstream target not found".to_string())
+                    })?;
 
                 let before = target.clone();
                 let mut active: upstream_targets::ActiveModel = target.into();
@@ -600,11 +577,10 @@ async fn update_target(
 
                 let updated = active.update(txn).await?;
                 let diff = json!({"before": before, "after": updated});
-                Ok::<_, AppError>((updated, diff))
+                Ok::<_, anyhow::Error>((updated, diff))
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
     spawn_audit(
         state.db.clone(),
@@ -620,7 +596,7 @@ async fn delete_target(
     headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<JsonValue>> {
+) -> Result<Json<JsonValue>> {
     let actor = actor_from_headers(&headers);
     let before = state
         .db
@@ -628,11 +604,10 @@ async fn delete_target(
             Box::pin(async move {
                 let before = upstream_targets::Entity::find_by_id(id).one(txn).await?;
                 upstream_targets::Entity::delete_by_id(id).exec(txn).await?;
-                Ok::<_, AppError>(before)
+                Ok::<_, anyhow::Error>(before)
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
     spawn_audit(
         state.db.clone(),
@@ -652,7 +627,7 @@ struct TargetListQuery {
 async fn list_targets(
     State(state): State<AppState>,
     Query(params): Query<TargetListQuery>,
-) -> ApiResult<Json<Vec<UpstreamTargetModel>>> {
+) -> Result<Json<Vec<UpstreamTargetModel>>> {
     let mut query = upstream_targets::Entity::find();
     if let Some(pool_id) = params.pool_id {
         query = query.filter(upstream_targets::Column::PoolId.eq(pool_id));
@@ -665,7 +640,7 @@ async fn create_tls_policy(
     headers: HeaderMap,
     State(state): State<AppState>,
     Json(payload): Json<CreateTlsPolicy>,
-) -> ApiResult<Json<TlsPolicyModel>> {
+) -> Result<Json<TlsPolicyModel>> {
     let actor = actor_from_headers(&headers);
     let mode = payload.mode;
     let domains = payload.domains;
@@ -682,11 +657,10 @@ async fn create_tls_policy(
                     ..Default::default()
                 };
                 let tls = active.insert(txn).await?;
-                Ok::<_, AppError>(tls)
+                Ok::<_, anyhow::Error>(tls)
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
     spawn_audit(
         state.db.clone(),
@@ -698,7 +672,7 @@ async fn create_tls_policy(
     Ok(Json(tls))
 }
 
-async fn list_tls(State(state): State<AppState>) -> ApiResult<Json<Vec<TlsPolicyModel>>> {
+async fn list_tls(State(state): State<AppState>) -> Result<Json<Vec<TlsPolicyModel>>> {
     let list = tls_policies::Entity::find().all(&state.db).await?;
     Ok(Json(list))
 }
@@ -708,7 +682,7 @@ async fn update_tls_policy(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateTlsPolicy>,
-) -> ApiResult<Json<TlsPolicyModel>> {
+) -> Result<Json<TlsPolicyModel>> {
     let actor = actor_from_headers(&headers);
     let (updated, audit_diff) = state
         .db
@@ -718,7 +692,7 @@ async fn update_tls_policy(
                 let tls = tls_policies::Entity::find_by_id(id)
                     .one(txn)
                     .await?
-                    .ok_or_else(|| AppError::NotFound("tls policy not found".to_string()))?;
+                    .ok_or_else(|| GatewayError::NotFound("tls policy not found".to_string()))?;
 
                 let before = tls.clone();
                 let mut active: tls_policies::ActiveModel = tls.into();
@@ -735,11 +709,10 @@ async fn update_tls_policy(
 
                 let updated = active.update(txn).await?;
                 let diff = json!({"before": before, "after": updated});
-                Ok::<_, AppError>((updated, diff))
+                Ok::<_, anyhow::Error>((updated, diff))
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
     spawn_audit(
         state.db.clone(),
@@ -754,7 +727,7 @@ async fn update_tls_policy(
 async fn renew_certificate(
     headers: HeaderMap,
     State(state): State<AppState>,
-) -> ApiResult<Json<JsonValue>> {
+) -> Result<Json<JsonValue>> {
     let actor = actor_from_headers(&headers);
     state
         .db
@@ -765,11 +738,10 @@ async fn renew_certificate(
                     .filter(tls_policies::Column::Mode.eq("auto"))
                     .exec(txn)
                     .await?;
-                Ok::<_, AppError>(())
+                Ok::<_, anyhow::Error>(())
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
     spawn_audit(
         state.db.clone(),
@@ -803,7 +775,7 @@ struct ValidateResponse {
     errors: Vec<String>,
 }
 
-async fn validate_config(State(state): State<AppState>) -> ApiResult<Json<ValidateResponse>> {
+async fn validate_config(State(state): State<AppState>) -> Result<Json<ValidateResponse>> {
     let snapshot = build_snapshot(&state.db).await?;
     let mut errors = Vec::new();
     validate_snapshot(
@@ -821,7 +793,7 @@ async fn validate_config(State(state): State<AppState>) -> ApiResult<Json<Valida
 async fn publish_config(
     State(state): State<AppState>,
     Json(payload): Json<PublishRequest>,
-) -> ApiResult<Json<ConfigVersionModel>> {
+) -> Result<Json<ConfigVersionModel>> {
     let snapshot = build_snapshot(&state.db).await?;
     let mut errors = Vec::new();
     validate_snapshot(
@@ -831,11 +803,10 @@ async fn publish_config(
         state.https_port_range,
     );
     if !errors.is_empty() {
-        return Err(AppError::BadRequest(errors.join("; ")));
+        return Err(GatewayError::validation(errors.join("; ")));
     }
 
-    let snapshot_json =
-        serde_json::to_value(&snapshot).map_err(|err| AppError::Internal(err.into()))?;
+    let snapshot_json = serde_json::to_value(&snapshot)?;
 
     let actor = payload.actor.clone();
     let actor_for_txn = actor.clone();
@@ -859,11 +830,10 @@ async fn publish_config(
                     ..Default::default()
                 };
                 let version = active.insert(txn).await?;
-                Ok::<_, AppError>(version)
+                Ok::<_, anyhow::Error>(version)
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
     state.snapshots.apply(snapshot).await?;
 
@@ -879,7 +849,7 @@ async fn publish_config(
 async fn rollback_config(
     State(state): State<AppState>,
     Json(payload): Json<RollbackRequest>,
-) -> ApiResult<Json<ConfigVersionModel>> {
+) -> Result<Json<ConfigVersionModel>> {
     let version_id = payload.version_id;
     let actor = payload.actor.clone();
 
@@ -890,7 +860,9 @@ async fn rollback_config(
                 let version = config_versions::Entity::find_by_id(version_id)
                     .one(txn)
                     .await?
-                    .ok_or_else(|| AppError::NotFound("config version not found".to_string()))?;
+                    .ok_or_else(|| {
+                        GatewayError::NotFound("config version not found".to_string())
+                    })?;
 
                 config_versions::Entity::update_many()
                     .col_expr(config_versions::Column::Status, Expr::value("archived"))
@@ -902,14 +874,12 @@ async fn rollback_config(
                     .filter(config_versions::Column::Id.eq(version_id))
                     .exec(txn)
                     .await?;
-                Ok::<_, AppError>(version)
+                Ok::<_, anyhow::Error>(version)
             })
         })
-        .await
-        .map_err(AppError::from)?;
+        .await?;
 
-    let snapshot: Snapshot = serde_json::from_value(version.snapshot_json.clone())
-        .map_err(|err| AppError::Internal(err.into()))?;
+    let snapshot: Snapshot = serde_json::from_value(version.snapshot_json.clone())?;
     state.snapshots.apply(snapshot).await?;
 
     spawn_audit(
@@ -921,7 +891,7 @@ async fn rollback_config(
     Ok(Json(version))
 }
 
-async fn list_versions(State(state): State<AppState>) -> ApiResult<Json<Vec<ConfigVersionModel>>> {
+async fn list_versions(State(state): State<AppState>) -> Result<Json<Vec<ConfigVersionModel>>> {
     let list = config_versions::Entity::find()
         .order_by_desc(config_versions::Column::CreatedAt)
         .all(&state.db)
@@ -932,17 +902,17 @@ async fn list_versions(State(state): State<AppState>) -> ApiResult<Json<Vec<Conf
 async fn get_version(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<ConfigVersionModel>> {
+) -> Result<Json<ConfigVersionModel>> {
     let version = config_versions::Entity::find_by_id(id)
         .one(&state.db)
         .await?
-        .ok_or_else(|| AppError::NotFound("config version not found".to_string()))?;
+        .ok_or_else(|| GatewayError::NotFound("config version not found".to_string()))?;
     Ok(Json(version))
 }
 
 async fn get_published_snapshot(
     State(state): State<AppState>,
-) -> ApiResult<Json<PublishedSnapshotResponse>> {
+) -> Result<Json<PublishedSnapshotResponse>> {
     let version = config_versions::Entity::find()
         .filter(config_versions::Column::Status.eq("published"))
         .order_by_desc(config_versions::Column::CreatedAt)
@@ -950,21 +920,20 @@ async fn get_published_snapshot(
         .await?;
     match version {
         Some(v) => {
-            let snapshot: Snapshot = serde_json::from_value(v.snapshot_json)
-                .map_err(|err| AppError::Internal(err.into()))?;
+            let snapshot: Snapshot = serde_json::from_value(v.snapshot_json)?;
             Ok(Json(PublishedSnapshotResponse {
                 version_id: Some(v.id),
                 snapshot,
             }))
         }
-        None => Err(AppError::NotFound("no published config".to_string())),
+        None => Err(GatewayError::NotFound("no published config".to_string())),
     }
 }
 
 async fn register_node(
     State(state): State<AppState>,
     Json(payload): Json<NodeRegisterRequest>,
-) -> ApiResult<Json<NodeStatusModel>> {
+) -> Result<Json<NodeStatusModel>> {
     let existing = node_status::Entity::find()
         .filter(node_status::Column::NodeId.eq(&payload.node_id))
         .one(&state.db)
@@ -993,12 +962,12 @@ async fn register_node(
 async fn heartbeat_node(
     State(state): State<AppState>,
     Json(payload): Json<NodeHeartbeatRequest>,
-) -> ApiResult<Json<NodeStatusModel>> {
+) -> Result<Json<NodeStatusModel>> {
     let node = node_status::Entity::find()
         .filter(node_status::Column::NodeId.eq(&payload.node_id))
         .one(&state.db)
         .await?
-        .ok_or_else(|| AppError::NotFound("node not found".to_string()))?;
+        .ok_or_else(|| GatewayError::NotFound("node not found".to_string()))?;
 
     let mut active: node_status::ActiveModel = node.into();
     active.version_id = Set(payload.version_id);
@@ -1009,7 +978,7 @@ async fn heartbeat_node(
     Ok(Json(updated))
 }
 
-async fn list_nodes(State(state): State<AppState>) -> ApiResult<Json<Vec<NodeStatusView>>> {
+async fn list_nodes(State(state): State<AppState>) -> Result<Json<Vec<NodeStatusView>>> {
     let published = config_versions::Entity::find()
         .filter(config_versions::Column::Status.eq("published"))
         .order_by_desc(config_versions::Column::CreatedAt)
@@ -1040,7 +1009,7 @@ async fn list_nodes(State(state): State<AppState>) -> ApiResult<Json<Vec<NodeSta
     Ok(Json(list))
 }
 
-async fn list_audit(State(state): State<AppState>) -> ApiResult<Json<Vec<AuditLogModel>>> {
+async fn list_audit(State(state): State<AppState>) -> Result<Json<Vec<AuditLogModel>>> {
     let list = audit_logs::Entity::find()
         .order_by_desc(audit_logs::Column::CreatedAt)
         .all(&state.db)
@@ -1055,10 +1024,10 @@ async fn metrics() -> axum::response::Response {
 async fn get_acme_challenge(
     State(state): State<AppState>,
     Path(token): Path<String>,
-) -> ApiResult<Json<JsonValue>> {
+) -> Result<Json<JsonValue>> {
     match state.acme_store.get(&token).await {
         Some(key_auth) => Ok(Json(json!({"key_auth": key_auth}))),
-        None => Err(AppError::NotFound("challenge not found".to_string())),
+        None => Err(GatewayError::NotFound("challenge not found".to_string())),
     }
 }
 
@@ -1067,7 +1036,7 @@ async fn add_audit<C>(
     actor: &str,
     action: &str,
     diff: JsonValue,
-) -> Result<(), sea_orm::DbErr>
+) -> std::result::Result<(), sea_orm::DbErr>
 where
     C: ConnectionTrait,
 {
