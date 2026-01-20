@@ -1,4 +1,5 @@
 mod health;
+mod metrics;
 mod node;
 mod proxy;
 mod tls;
@@ -11,6 +12,7 @@ use pingora::listeners::TlsAcceptCallbacks;
 use pingora::listeners::tls::TlsSettings;
 use pingora::proxy::http_proxy_service;
 use pingora::server::Server;
+use pingora::services::listening::Service as ListeningService;
 use proxy::AcmeChallengeClient;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -131,6 +133,10 @@ async fn main() -> Result<()> {
     }
 
     server.add_service(service);
+
+    let mut metrics_service = ListeningService::prometheus_http_service();
+    metrics_service.add_tcp(&config.data_plane_metrics_addr);
+    server.add_service(metrics_service);
 
     tasks.push(tokio::task::spawn_blocking(move || {
         server.run_forever();

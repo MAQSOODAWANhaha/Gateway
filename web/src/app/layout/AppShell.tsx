@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
+import { ActorSwitcher } from "@/components/ActorSwitcher";
 import { Badge } from "@/shadcn/ui/badge";
 import { AppSidebar } from "@/app/layout/AppSidebar";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/shadcn/ui/sidebar";
@@ -16,6 +17,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             <Badge>API / 管理</Badge>
           </div>
           <div className="flex items-center gap-3">
+            <ActorSwitcher />
             <ThemeSwitcher />
             <a
               href="/api/v1/metrics"

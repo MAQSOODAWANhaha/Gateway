@@ -1,6 +1,7 @@
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use sea_orm::TransactionError;
 use serde_json::json;
 use thiserror::Error;
 
@@ -26,5 +27,14 @@ impl IntoResponse for AppError {
         };
         let body = Json(json!({"error": message}));
         (status, body).into_response()
+    }
+}
+
+impl From<TransactionError<AppError>> for AppError {
+    fn from(err: TransactionError<AppError>) -> Self {
+        match err {
+            TransactionError::Connection(db) => Self::Db(db),
+            TransactionError::Transaction(app) => app,
+        }
     }
 }

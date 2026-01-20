@@ -2,6 +2,7 @@ mod acme;
 mod api;
 mod db;
 mod error;
+mod metrics;
 mod state;
 
 use crate::acme::AcmeChallengeStore;

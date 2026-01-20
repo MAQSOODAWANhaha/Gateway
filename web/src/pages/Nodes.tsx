@@ -35,6 +35,19 @@ export default function Nodes() {
   const columns = [
     { key: "node_id", title: "节点" },
     { key: "version_id", title: "版本" },
+    { key: "published_version_id", title: "发布版本" },
+    {
+      key: "consistent",
+      title: "一致性",
+      render: (row: NodeStatus) => {
+        if (!row.published_version_id) return <span className="text-[var(--muted)]">未发布</span>;
+        return row.consistent ? (
+          <span className="text-[var(--success)]">一致</span>
+        ) : (
+          <span className="text-[var(--danger)]">不一致</span>
+        );
+      }
+    },
     { key: "heartbeat_at", title: "心跳时间" }
   ];
 

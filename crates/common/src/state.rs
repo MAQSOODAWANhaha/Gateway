@@ -1,7 +1,7 @@
 use crate::snapshot::Snapshot;
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock, watch};
 
 #[derive(Clone)]
 pub struct SnapshotStore {

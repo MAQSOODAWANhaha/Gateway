@@ -2,6 +2,7 @@ use crate::error::AppError;
 use crate::state::AppState;
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::routing::{get, patch, post};
 use chrono::Utc;
 use gateway_common::entities::{
@@ -11,10 +12,14 @@ use gateway_common::entities::{
 use gateway_common::models::*;
 use gateway_common::snapshot::{PublishedSnapshotResponse, Snapshot, build_snapshot};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
+    TransactionTrait,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use tower::ServiceBuilder;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -30,8 +35,24 @@ type ConfigVersionModel = config_versions::Model;
 type NodeStatusModel = node_status::Model;
 type AuditLogModel = audit_logs::Model;
 
+#[derive(Debug, Serialize)]
+struct NodeStatusView {
+    id: Uuid,
+    node_id: String,
+    version_id: Option<Uuid>,
+    published_version_id: Option<Uuid>,
+    consistent: bool,
+    heartbeat_at: String,
+    metadata: Option<JsonValue>,
+}
+
 pub fn router(state: AppState) -> axum::Router {
     let static_files = ServeDir::new("web/dist").fallback(ServeFile::new("web/dist/index.html"));
+    let static_files = ServiceBuilder::new()
+        .layer(axum::middleware::from_fn(
+            crate::metrics::metrics_middleware,
+        ))
+        .service(static_files);
     axum::Router::new()
         .route(
             "/api/v1/listeners",
@@ -78,25 +99,52 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/api/v1/audit", get(list_audit))
         .route("/api/v1/metrics", get(metrics))
         .fallback_service(static_files)
+        .route_layer(axum::middleware::from_fn(
+            crate::metrics::metrics_middleware,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
 async fn create_listener(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(payload): Json<CreateListener>,
 ) -> ApiResult<Json<ListenerModel>> {
+    let actor = actor_from_headers(&headers);
     let enabled = payload.enabled.unwrap_or(true);
-    let active = listeners::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        name: Set(payload.name),
-        port: Set(payload.port),
-        protocol: Set(payload.protocol),
-        tls_policy_id: Set(payload.tls_policy_id),
-        enabled: Set(enabled),
-        ..Default::default()
-    };
-    let listener = active.insert(&state.db).await?;
+    let name = payload.name;
+    let port = payload.port;
+    let protocol = payload.protocol;
+    let tls_policy_id = payload.tls_policy_id;
+
+    let listener = state
+        .db
+        .transaction(|txn| {
+            Box::pin(async move {
+                let active = listeners::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    name: Set(name),
+                    port: Set(port),
+                    protocol: Set(protocol),
+                    tls_policy_id: Set(tls_policy_id),
+                    enabled: Set(enabled),
+                    ..Default::default()
+                };
+                let listener = active.insert(txn).await?;
+                Ok::<_, AppError>(listener)
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "listener.create".to_string(),
+        json!({"listener": listener.clone()}),
+    );
+
     Ok(Json(listener))
 }
 
@@ -120,61 +168,128 @@ async fn get_listener(
 }
 
 async fn update_listener(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateListener>,
 ) -> ApiResult<Json<ListenerModel>> {
-    let listener = listeners::Entity::find_by_id(id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("listener not found".to_string()))?;
+    let actor = actor_from_headers(&headers);
 
-    let mut active: listeners::ActiveModel = listener.into();
-    if let Some(name) = payload.name {
-        active.name = Set(name);
-    }
-    if let Some(port) = payload.port {
-        active.port = Set(port);
-    }
-    if let Some(protocol) = payload.protocol {
-        active.protocol = Set(protocol);
-    }
-    if let Some(tls_policy_id) = payload.tls_policy_id {
-        active.tls_policy_id = Set(Some(tls_policy_id));
-    }
-    if let Some(enabled) = payload.enabled {
-        active.enabled = Set(enabled);
-    }
-    active.updated_at = Set(Utc::now().into());
+    let (updated, audit_diff) = state
+        .db
+        .transaction(|txn| {
+            let payload = payload.clone();
+            Box::pin(async move {
+                let listener = listeners::Entity::find_by_id(id)
+                    .one(txn)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("listener not found".to_string()))?;
 
-    let updated = active.update(&state.db).await?;
+                let before = listener.clone();
+                let mut active: listeners::ActiveModel = listener.into();
+                if let Some(name) = payload.name {
+                    active.name = Set(name);
+                }
+                if let Some(port) = payload.port {
+                    active.port = Set(port);
+                }
+                if let Some(protocol) = payload.protocol {
+                    active.protocol = Set(protocol);
+                }
+                if let Some(tls_policy_id) = payload.tls_policy_id {
+                    active.tls_policy_id = Set(Some(tls_policy_id));
+                }
+                if let Some(enabled) = payload.enabled {
+                    active.enabled = Set(enabled);
+                }
+                active.updated_at = Set(Utc::now().into());
+
+                let updated = active.update(txn).await?;
+                let diff = json!({"before": before, "after": updated});
+                Ok::<_, AppError>((updated, diff))
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "listener.update".to_string(),
+        audit_diff,
+    );
+
     Ok(Json(updated))
 }
 
 async fn delete_listener(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<JsonValue>> {
-    listeners::Entity::delete_by_id(id).exec(&state.db).await?;
+    let actor = actor_from_headers(&headers);
+    let before = state
+        .db
+        .transaction(|txn| {
+            Box::pin(async move {
+                let before = listeners::Entity::find_by_id(id).one(txn).await?;
+                listeners::Entity::delete_by_id(id).exec(txn).await?;
+                Ok::<_, AppError>(before)
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "listener.delete".to_string(),
+        json!({"id": id, "before": before}),
+    );
     Ok(Json(json!({"deleted": true})))
 }
 
 async fn create_route(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(payload): Json<CreateRoute>,
 ) -> ApiResult<Json<RouteModel>> {
+    let actor = actor_from_headers(&headers);
     let enabled = payload.enabled.unwrap_or(true);
-    let active = routes::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        listener_id: Set(payload.listener_id),
-        r#type: Set(payload.r#type),
-        match_expr: Set(payload.match_expr),
-        priority: Set(payload.priority),
-        upstream_pool_id: Set(payload.upstream_pool_id),
-        enabled: Set(enabled),
-        ..Default::default()
-    };
-    let route = active.insert(&state.db).await?;
+    let listener_id = payload.listener_id;
+    let r#type = payload.r#type;
+    let match_expr = payload.match_expr;
+    let priority = payload.priority;
+    let upstream_pool_id = payload.upstream_pool_id;
+
+    let route = state
+        .db
+        .transaction(|txn| {
+            Box::pin(async move {
+                let active = routes::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    listener_id: Set(listener_id),
+                    r#type: Set(r#type),
+                    match_expr: Set(match_expr),
+                    priority: Set(priority),
+                    upstream_pool_id: Set(upstream_pool_id),
+                    enabled: Set(enabled),
+                    ..Default::default()
+                };
+                let route = active.insert(txn).await?;
+                Ok::<_, AppError>(route)
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "route.create".to_string(),
+        json!({"route": route.clone()}),
+    );
+
     Ok(Json(route))
 }
 
@@ -202,57 +317,122 @@ async fn get_route(
 }
 
 async fn update_route(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateRoute>,
 ) -> ApiResult<Json<RouteModel>> {
-    let route = routes::Entity::find_by_id(id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("route not found".to_string()))?;
+    let actor = actor_from_headers(&headers);
+    let (updated, audit_diff) = state
+        .db
+        .transaction(|txn| {
+            let payload = payload.clone();
+            Box::pin(async move {
+                let route = routes::Entity::find_by_id(id)
+                    .one(txn)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("route not found".to_string()))?;
 
-    let mut active: routes::ActiveModel = route.into();
-    if let Some(r#type) = payload.r#type {
-        active.r#type = Set(r#type);
-    }
-    if let Some(match_expr) = payload.match_expr {
-        active.match_expr = Set(match_expr);
-    }
-    if let Some(priority) = payload.priority {
-        active.priority = Set(priority);
-    }
-    if let Some(upstream_pool_id) = payload.upstream_pool_id {
-        active.upstream_pool_id = Set(upstream_pool_id);
-    }
-    if let Some(enabled) = payload.enabled {
-        active.enabled = Set(enabled);
-    }
-    active.updated_at = Set(Utc::now().into());
+                let before = route.clone();
+                let mut active: routes::ActiveModel = route.into();
+                if let Some(r#type) = payload.r#type {
+                    active.r#type = Set(r#type);
+                }
+                if let Some(match_expr) = payload.match_expr {
+                    active.match_expr = Set(match_expr);
+                }
+                if let Some(priority) = payload.priority {
+                    active.priority = Set(priority);
+                }
+                if let Some(upstream_pool_id) = payload.upstream_pool_id {
+                    active.upstream_pool_id = Set(upstream_pool_id);
+                }
+                if let Some(enabled) = payload.enabled {
+                    active.enabled = Set(enabled);
+                }
+                active.updated_at = Set(Utc::now().into());
 
-    let updated = active.update(&state.db).await?;
+                let updated = active.update(txn).await?;
+                let diff = json!({"before": before, "after": updated});
+                Ok::<_, AppError>((updated, diff))
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "route.update".to_string(),
+        audit_diff,
+    );
+
     Ok(Json(updated))
 }
 
 async fn delete_route(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<JsonValue>> {
-    routes::Entity::delete_by_id(id).exec(&state.db).await?;
+    let actor = actor_from_headers(&headers);
+    let before = state
+        .db
+        .transaction(|txn| {
+            Box::pin(async move {
+                let before = routes::Entity::find_by_id(id).one(txn).await?;
+                routes::Entity::delete_by_id(id).exec(txn).await?;
+                Ok::<_, AppError>(before)
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "route.delete".to_string(),
+        json!({"id": id, "before": before}),
+    );
+
     Ok(Json(json!({"deleted": true})))
 }
 
 async fn create_pool(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(payload): Json<CreateUpstreamPool>,
 ) -> ApiResult<Json<UpstreamPoolModel>> {
-    let active = upstream_pools::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        name: Set(payload.name),
-        policy: Set(payload.policy),
-        health_check: Set(payload.health_check),
-        ..Default::default()
-    };
-    let pool = active.insert(&state.db).await?;
+    let actor = actor_from_headers(&headers);
+    let name = payload.name;
+    let policy = payload.policy;
+    let health_check = payload.health_check;
+
+    let pool = state
+        .db
+        .transaction(|txn| {
+            Box::pin(async move {
+                let active = upstream_pools::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    name: Set(name),
+                    policy: Set(policy),
+                    health_check: Set(health_check),
+                    ..Default::default()
+                };
+                let pool = active.insert(txn).await?;
+                Ok::<_, AppError>(pool)
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "upstream_pool.create".to_string(),
+        json!({"pool": pool.clone()}),
+    );
+
     Ok(Json(pool))
 }
 
@@ -273,93 +453,194 @@ async fn get_pool(
 }
 
 async fn update_pool(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateUpstreamPool>,
 ) -> ApiResult<Json<UpstreamPoolModel>> {
-    let pool = upstream_pools::Entity::find_by_id(id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("upstream pool not found".to_string()))?;
+    let actor = actor_from_headers(&headers);
+    let (updated, audit_diff) = state
+        .db
+        .transaction(|txn| {
+            let payload = payload.clone();
+            Box::pin(async move {
+                let pool = upstream_pools::Entity::find_by_id(id)
+                    .one(txn)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("upstream pool not found".to_string()))?;
 
-    let mut active: upstream_pools::ActiveModel = pool.into();
-    if let Some(name) = payload.name {
-        active.name = Set(name);
-    }
-    if let Some(policy) = payload.policy {
-        active.policy = Set(policy);
-    }
-    if let Some(health_check) = payload.health_check {
-        active.health_check = Set(Some(health_check));
-    }
-    active.updated_at = Set(Utc::now().into());
+                let before = pool.clone();
+                let mut active: upstream_pools::ActiveModel = pool.into();
+                if let Some(name) = payload.name {
+                    active.name = Set(name);
+                }
+                if let Some(policy) = payload.policy {
+                    active.policy = Set(policy);
+                }
+                if let Some(health_check) = payload.health_check {
+                    active.health_check = Set(Some(health_check));
+                }
+                active.updated_at = Set(Utc::now().into());
 
-    let updated = active.update(&state.db).await?;
+                let updated = active.update(txn).await?;
+                let diff = json!({"before": before, "after": updated});
+                Ok::<_, AppError>((updated, diff))
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "upstream_pool.update".to_string(),
+        audit_diff,
+    );
+
     Ok(Json(updated))
 }
 
 async fn delete_pool(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<JsonValue>> {
-    upstream_pools::Entity::delete_by_id(id)
-        .exec(&state.db)
-        .await?;
+    let actor = actor_from_headers(&headers);
+    let before = state
+        .db
+        .transaction(|txn| {
+            Box::pin(async move {
+                let before = upstream_pools::Entity::find_by_id(id).one(txn).await?;
+                upstream_pools::Entity::delete_by_id(id).exec(txn).await?;
+                Ok::<_, AppError>(before)
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "upstream_pool.delete".to_string(),
+        json!({"id": id, "before": before}),
+    );
+
     Ok(Json(json!({"deleted": true})))
 }
 
 async fn create_target(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<CreateUpstreamTarget>,
 ) -> ApiResult<Json<UpstreamTargetModel>> {
+    let actor = actor_from_headers(&headers);
     let weight = payload.weight.unwrap_or(1);
     let enabled = payload.enabled.unwrap_or(true);
-    let active = upstream_targets::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        pool_id: Set(id),
-        address: Set(payload.address),
-        weight: Set(weight),
-        enabled: Set(enabled),
-        ..Default::default()
-    };
-    let target = active.insert(&state.db).await?;
+    let address = payload.address;
+
+    let target = state
+        .db
+        .transaction(|txn| {
+            Box::pin(async move {
+                let active = upstream_targets::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    pool_id: Set(id),
+                    address: Set(address),
+                    weight: Set(weight),
+                    enabled: Set(enabled),
+                    ..Default::default()
+                };
+                let target = active.insert(txn).await?;
+                Ok::<_, AppError>(target)
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "upstream_target.create".to_string(),
+        json!({"target": target.clone()}),
+    );
+
     Ok(Json(target))
 }
 
 async fn update_target(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateUpstreamTarget>,
 ) -> ApiResult<Json<UpstreamTargetModel>> {
-    let target = upstream_targets::Entity::find_by_id(id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("upstream target not found".to_string()))?;
+    let actor = actor_from_headers(&headers);
+    let (updated, audit_diff) = state
+        .db
+        .transaction(|txn| {
+            let payload = payload.clone();
+            Box::pin(async move {
+                let target = upstream_targets::Entity::find_by_id(id)
+                    .one(txn)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("upstream target not found".to_string()))?;
 
-    let mut active: upstream_targets::ActiveModel = target.into();
-    if let Some(address) = payload.address {
-        active.address = Set(address);
-    }
-    if let Some(weight) = payload.weight {
-        active.weight = Set(weight);
-    }
-    if let Some(enabled) = payload.enabled {
-        active.enabled = Set(enabled);
-    }
-    active.updated_at = Set(Utc::now().into());
+                let before = target.clone();
+                let mut active: upstream_targets::ActiveModel = target.into();
+                if let Some(address) = payload.address {
+                    active.address = Set(address);
+                }
+                if let Some(weight) = payload.weight {
+                    active.weight = Set(weight);
+                }
+                if let Some(enabled) = payload.enabled {
+                    active.enabled = Set(enabled);
+                }
+                active.updated_at = Set(Utc::now().into());
 
-    let updated = active.update(&state.db).await?;
+                let updated = active.update(txn).await?;
+                let diff = json!({"before": before, "after": updated});
+                Ok::<_, AppError>((updated, diff))
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "upstream_target.update".to_string(),
+        audit_diff,
+    );
+
     Ok(Json(updated))
 }
 
 async fn delete_target(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<JsonValue>> {
-    upstream_targets::Entity::delete_by_id(id)
-        .exec(&state.db)
-        .await?;
+    let actor = actor_from_headers(&headers);
+    let before = state
+        .db
+        .transaction(|txn| {
+            Box::pin(async move {
+                let before = upstream_targets::Entity::find_by_id(id).one(txn).await?;
+                upstream_targets::Entity::delete_by_id(id).exec(txn).await?;
+                Ok::<_, AppError>(before)
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "upstream_target.delete".to_string(),
+        json!({"id": id, "before": before}),
+    );
+
     Ok(Json(json!({"deleted": true})))
 }
 
@@ -381,17 +662,39 @@ async fn list_targets(
 }
 
 async fn create_tls_policy(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(payload): Json<CreateTlsPolicy>,
 ) -> ApiResult<Json<TlsPolicyModel>> {
-    let active = tls_policies::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        mode: Set(payload.mode),
-        domains: Set(payload.domains),
-        status: Set("pending".to_string()),
-        ..Default::default()
-    };
-    let tls = active.insert(&state.db).await?;
+    let actor = actor_from_headers(&headers);
+    let mode = payload.mode;
+    let domains = payload.domains;
+
+    let tls = state
+        .db
+        .transaction(|txn| {
+            Box::pin(async move {
+                let active = tls_policies::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    mode: Set(mode),
+                    domains: Set(domains),
+                    status: Set("pending".to_string()),
+                    ..Default::default()
+                };
+                let tls = active.insert(txn).await?;
+                Ok::<_, AppError>(tls)
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "tls_policy.create".to_string(),
+        json!({"policy": tls.clone()}),
+    );
+
     Ok(Json(tls))
 }
 
@@ -401,37 +704,80 @@ async fn list_tls(State(state): State<AppState>) -> ApiResult<Json<Vec<TlsPolicy
 }
 
 async fn update_tls_policy(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateTlsPolicy>,
 ) -> ApiResult<Json<TlsPolicyModel>> {
-    let tls = tls_policies::Entity::find_by_id(id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("tls policy not found".to_string()))?;
+    let actor = actor_from_headers(&headers);
+    let (updated, audit_diff) = state
+        .db
+        .transaction(|txn| {
+            let payload = payload.clone();
+            Box::pin(async move {
+                let tls = tls_policies::Entity::find_by_id(id)
+                    .one(txn)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("tls policy not found".to_string()))?;
 
-    let mut active: tls_policies::ActiveModel = tls.into();
-    if let Some(mode) = payload.mode {
-        active.mode = Set(mode);
-    }
-    if let Some(domains) = payload.domains {
-        active.domains = Set(domains);
-    }
-    if let Some(status) = payload.status {
-        active.status = Set(status);
-    }
-    active.updated_at = Set(Utc::now().into());
+                let before = tls.clone();
+                let mut active: tls_policies::ActiveModel = tls.into();
+                if let Some(mode) = payload.mode {
+                    active.mode = Set(mode);
+                }
+                if let Some(domains) = payload.domains {
+                    active.domains = Set(domains);
+                }
+                if let Some(status) = payload.status {
+                    active.status = Set(status);
+                }
+                active.updated_at = Set(Utc::now().into());
 
-    let updated = active.update(&state.db).await?;
+                let updated = active.update(txn).await?;
+                let diff = json!({"before": before, "after": updated});
+                Ok::<_, AppError>((updated, diff))
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "tls_policy.update".to_string(),
+        audit_diff,
+    );
+
     Ok(Json(updated))
 }
 
-async fn renew_certificate(State(state): State<AppState>) -> ApiResult<Json<JsonValue>> {
-    tls_policies::Entity::update_many()
-        .col_expr(tls_policies::Column::Status, Expr::value("pending"))
-        .filter(tls_policies::Column::Mode.eq("auto"))
-        .exec(&state.db)
-        .await?;
+async fn renew_certificate(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> ApiResult<Json<JsonValue>> {
+    let actor = actor_from_headers(&headers);
+    state
+        .db
+        .transaction(|txn| {
+            Box::pin(async move {
+                tls_policies::Entity::update_many()
+                    .col_expr(tls_policies::Column::Status, Expr::value("pending"))
+                    .filter(tls_policies::Column::Mode.eq("auto"))
+                    .exec(txn)
+                    .await?;
+                Ok::<_, AppError>(())
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "certificates.renew".to_string(),
+        json!({"scheduled": true}),
+    );
+
     Ok(Json(json!({"scheduled": true})))
 }
 
@@ -491,30 +837,42 @@ async fn publish_config(
     let snapshot_json =
         serde_json::to_value(&snapshot).map_err(|err| AppError::Internal(err.into()))?;
 
-    config_versions::Entity::update_many()
-        .col_expr(config_versions::Column::Status, Expr::value("archived"))
-        .filter(config_versions::Column::Status.eq("published"))
-        .exec(&state.db)
-        .await?;
+    let actor = payload.actor.clone();
+    let actor_for_txn = actor.clone();
+    let version = state
+        .db
+        .transaction(|txn| {
+            let actor = actor_for_txn.clone();
+            let snapshot_json = snapshot_json.clone();
+            Box::pin(async move {
+                config_versions::Entity::update_many()
+                    .col_expr(config_versions::Column::Status, Expr::value("archived"))
+                    .filter(config_versions::Column::Status.eq("published"))
+                    .exec(txn)
+                    .await?;
 
-    let active = config_versions::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        snapshot_json: Set(snapshot_json),
-        status: Set("published".to_string()),
-        created_by: Set(payload.actor.clone()),
-        ..Default::default()
-    };
-    let version = active.insert(&state.db).await?;
-
-    add_audit(
-        &state.db,
-        &payload.actor,
-        "publish",
-        json!({"version_id": version.id}),
-    )
-    .await?;
+                let active = config_versions::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    snapshot_json: Set(snapshot_json),
+                    status: Set("published".to_string()),
+                    created_by: Set(actor.clone()),
+                    ..Default::default()
+                };
+                let version = active.insert(txn).await?;
+                Ok::<_, AppError>(version)
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
 
     state.snapshots.apply(snapshot).await?;
+
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "publish".to_string(),
+        json!({"version_id": version.id}),
+    );
     Ok(Json(version))
 }
 
@@ -522,34 +880,44 @@ async fn rollback_config(
     State(state): State<AppState>,
     Json(payload): Json<RollbackRequest>,
 ) -> ApiResult<Json<ConfigVersionModel>> {
-    let version = config_versions::Entity::find_by_id(payload.version_id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("config version not found".to_string()))?;
+    let version_id = payload.version_id;
+    let actor = payload.actor.clone();
 
-    config_versions::Entity::update_many()
-        .col_expr(config_versions::Column::Status, Expr::value("archived"))
-        .filter(config_versions::Column::Status.eq("published"))
-        .exec(&state.db)
-        .await?;
-    config_versions::Entity::update_many()
-        .col_expr(config_versions::Column::Status, Expr::value("published"))
-        .filter(config_versions::Column::Id.eq(payload.version_id))
-        .exec(&state.db)
-        .await?;
+    let version = state
+        .db
+        .transaction(|txn| {
+            Box::pin(async move {
+                let version = config_versions::Entity::find_by_id(version_id)
+                    .one(txn)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("config version not found".to_string()))?;
+
+                config_versions::Entity::update_many()
+                    .col_expr(config_versions::Column::Status, Expr::value("archived"))
+                    .filter(config_versions::Column::Status.eq("published"))
+                    .exec(txn)
+                    .await?;
+                config_versions::Entity::update_many()
+                    .col_expr(config_versions::Column::Status, Expr::value("published"))
+                    .filter(config_versions::Column::Id.eq(version_id))
+                    .exec(txn)
+                    .await?;
+                Ok::<_, AppError>(version)
+            })
+        })
+        .await
+        .map_err(AppError::from)?;
 
     let snapshot: Snapshot = serde_json::from_value(version.snapshot_json.clone())
         .map_err(|err| AppError::Internal(err.into()))?;
     state.snapshots.apply(snapshot).await?;
 
-    add_audit(
-        &state.db,
-        &payload.actor,
-        "rollback",
+    spawn_audit(
+        state.db.clone(),
+        actor,
+        "rollback".to_string(),
         json!({"version_id": version.id}),
-    )
-    .await?;
-
+    );
     Ok(Json(version))
 }
 
@@ -641,9 +1009,35 @@ async fn heartbeat_node(
     Ok(Json(updated))
 }
 
-async fn list_nodes(State(state): State<AppState>) -> ApiResult<Json<Vec<NodeStatusModel>>> {
+async fn list_nodes(State(state): State<AppState>) -> ApiResult<Json<Vec<NodeStatusView>>> {
+    let published = config_versions::Entity::find()
+        .filter(config_versions::Column::Status.eq("published"))
+        .order_by_desc(config_versions::Column::CreatedAt)
+        .one(&state.db)
+        .await?;
+    let published_version_id = published.map(|v| v.id);
+
     let nodes = node_status::Entity::find().all(&state.db).await?;
-    Ok(Json(nodes))
+    let list = nodes
+        .into_iter()
+        .map(|n| {
+            let consistent = match (published_version_id, n.version_id) {
+                (Some(published), Some(node)) => published == node,
+                _ => false,
+            };
+            NodeStatusView {
+                id: n.id,
+                node_id: n.node_id,
+                version_id: n.version_id,
+                published_version_id,
+                consistent,
+                heartbeat_at: n.heartbeat_at.to_rfc3339(),
+                metadata: n.metadata,
+            }
+        })
+        .collect();
+
+    Ok(Json(list))
 }
 
 async fn list_audit(State(state): State<AppState>) -> ApiResult<Json<Vec<AuditLogModel>>> {
@@ -654,8 +1048,8 @@ async fn list_audit(State(state): State<AppState>) -> ApiResult<Json<Vec<AuditLo
     Ok(Json(list))
 }
 
-async fn metrics() -> ApiResult<String> {
-    Ok("gateway_up 1\n".to_string())
+async fn metrics() -> axum::response::Response {
+    crate::metrics::render_metrics()
 }
 
 async fn get_acme_challenge(
@@ -668,12 +1062,15 @@ async fn get_acme_challenge(
     }
 }
 
-async fn add_audit(
-    db: &sea_orm::DatabaseConnection,
+async fn add_audit<C>(
+    db: &C,
     actor: &str,
     action: &str,
     diff: JsonValue,
-) -> Result<(), sea_orm::DbErr> {
+) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
     let active = audit_logs::ActiveModel {
         id: Set(Uuid::new_v4()),
         actor: Set(actor.to_string()),
@@ -682,6 +1079,71 @@ async fn add_audit(
         ..Default::default()
     };
     active.insert(db).await.map(|_| ())
+}
+
+fn spawn_audit(db: sea_orm::DatabaseConnection, actor: String, action: String, diff: JsonValue) {
+    tokio::spawn(async move {
+        if let Err(err) = add_audit(&db, &actor, &action, diff).await {
+            crate::metrics::inc_audit_write_failure();
+            tracing::warn!(
+                "failed to write audit log (action={}, actor={}): {}",
+                action,
+                actor,
+                err
+            );
+        }
+    });
+}
+
+fn actor_from_headers(headers: &HeaderMap) -> String {
+    let raw = headers
+        .get("x-actor")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+
+    match raw {
+        Some(value) => {
+            let decoded = decode_percent(value).unwrap_or_else(|| value.to_string());
+            let trimmed = decoded.trim();
+            if trimmed.is_empty() {
+                "unknown".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+        None => "unknown".to_string(),
+    }
+}
+
+fn decode_percent(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_value(bytes[i + 1])?;
+            let lo = hex_value(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn validate_snapshot(
@@ -729,38 +1191,38 @@ fn validate_snapshot(
                     errors.push(format!("duplicate port {}", port));
                 }
                 if listener.protocol.eq_ignore_ascii_case("https") {
-                    if let Some(range) = https_port_range {
-                        if !range.contains(port) {
-                            errors.push(format!(
-                                "listener {} https port {} outside HTTPS_PORT_RANGE",
-                                listener.id, port
-                            ));
-                        }
+                    if let Some(range) = https_port_range
+                        && !range.contains(port)
+                    {
+                        errors.push(format!(
+                            "listener {} https port {} outside HTTPS_PORT_RANGE",
+                            listener.id, port
+                        ));
                     }
-                    if let Some(range) = http_port_range {
-                        if range.contains(port) {
-                            errors.push(format!(
-                                "listener {} https port {} conflicts with HTTP_PORT_RANGE",
-                                listener.id, port
-                            ));
-                        }
+                    if let Some(range) = http_port_range
+                        && range.contains(port)
+                    {
+                        errors.push(format!(
+                            "listener {} https port {} conflicts with HTTP_PORT_RANGE",
+                            listener.id, port
+                        ));
                     }
                 } else {
-                    if let Some(range) = http_port_range {
-                        if !range.contains(port) {
-                            errors.push(format!(
-                                "listener {} http port {} outside HTTP_PORT_RANGE",
-                                listener.id, port
-                            ));
-                        }
+                    if let Some(range) = http_port_range
+                        && !range.contains(port)
+                    {
+                        errors.push(format!(
+                            "listener {} http port {} outside HTTP_PORT_RANGE",
+                            listener.id, port
+                        ));
                     }
-                    if let Some(range) = https_port_range {
-                        if range.contains(port) {
-                            errors.push(format!(
-                                "listener {} http port {} conflicts with HTTPS_PORT_RANGE",
-                                listener.id, port
-                            ));
-                        }
+                    if let Some(range) = https_port_range
+                        && range.contains(port)
+                    {
+                        errors.push(format!(
+                            "listener {} http port {} conflicts with HTTPS_PORT_RANGE",
+                            listener.id, port
+                        ));
                     }
                 }
             }
@@ -781,6 +1243,8 @@ fn validate_snapshot(
         validate_tls_policy(policy, errors);
     }
 
+    validate_route_conflicts(&snapshot.routes, errors);
+
     for route in &snapshot.routes {
         validate_route(
             route,
@@ -789,6 +1253,104 @@ fn validate_snapshot(
             &pool_ids,
             errors,
         );
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct RouteConflictKey {
+    listener_id: Uuid,
+    kind: String,
+    match_key: RouteMatchKey,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum RouteMatchKey {
+    Port,
+    Match(CanonicalRouteMatch),
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct CanonicalRouteMatch {
+    host: Option<String>,
+    path_prefix: Option<String>,
+    path_regex: Option<String>,
+    method: Option<Vec<String>>,
+    headers: Option<BTreeMap<String, String>>,
+    query: Option<BTreeMap<String, String>>,
+    ws: Option<bool>,
+}
+
+impl CanonicalRouteMatch {
+    fn from_match_expr(kind: &str, expr: &JsonValue) -> Option<Self> {
+        let parsed: RouteMatch = serde_json::from_value(expr.clone()).ok()?;
+        let mut method = parsed.method.map(|mut list| {
+            for m in &mut list {
+                *m = m.to_ascii_lowercase();
+            }
+            list.sort();
+            list.dedup();
+            list
+        });
+        if let Some(list) = &mut method
+            && list.is_empty()
+        {
+            method = None;
+        }
+
+        let headers = parsed.headers.map(|map| {
+            map.into_iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), v))
+                .collect::<BTreeMap<_, _>>()
+        });
+        let query = parsed
+            .query
+            .map(|map| map.into_iter().collect::<BTreeMap<_, _>>());
+
+        let ws = if kind.eq_ignore_ascii_case("ws") {
+            Some(true)
+        } else {
+            parsed.ws
+        };
+
+        Some(Self {
+            host: parsed.host.map(|h| h.to_ascii_lowercase()),
+            path_prefix: parsed.path_prefix,
+            path_regex: parsed.path_regex,
+            method,
+            headers,
+            query,
+            ws,
+        })
+    }
+}
+
+fn validate_route_conflicts(
+    routes: &[gateway_common::entities::routes::Model],
+    errors: &mut Vec<String>,
+) {
+    let mut seen: HashMap<RouteConflictKey, Uuid> = HashMap::new();
+    for route in routes.iter().filter(|r| r.enabled) {
+        let kind = route.r#type.to_ascii_lowercase();
+        let match_key = match kind.as_str() {
+            "port" => RouteMatchKey::Port,
+            "path" | "ws" => match CanonicalRouteMatch::from_match_expr(&kind, &route.match_expr) {
+                Some(match_expr) => RouteMatchKey::Match(match_expr),
+                None => continue,
+            },
+            _ => continue,
+        };
+
+        let key = RouteConflictKey {
+            listener_id: route.listener_id,
+            kind: kind.clone(),
+            match_key,
+        };
+        if let Some(other) = seen.insert(key, route.id) {
+            errors.push(format!(
+                "route {} conflicts with route {} (same match conditions)",
+                route.id, other
+            ));
+        }
     }
 }
 
@@ -822,47 +1384,6 @@ fn validate_listener(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode};
-    use gateway_common::snapshot::Snapshot;
-    use gateway_common::state::SnapshotStore;
-    use sea_orm::DatabaseConnection;
-    use tower::ServiceExt;
-
-    #[tokio::test]
-    async fn acme_challenge_route_uses_brace_params() {
-        let (snapshots, _rx) = SnapshotStore::new(Snapshot::default());
-        let state = AppState {
-            db: DatabaseConnection::default(),
-            snapshots,
-            acme_store: crate::acme::AcmeChallengeStore::default(),
-            http_port_range: None,
-            https_port_range: None,
-        };
-
-        let app = router(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/v1/acme/challenge/test-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.get("error").is_some());
-    }
-}
-
 fn validate_upstream_pool(
     pool: &gateway_common::entities::upstream_pools::Model,
     errors: &mut Vec<String>,
@@ -873,6 +1394,51 @@ fn validate_upstream_pool(
             "upstream pool {} invalid policy {}",
             pool.id, pool.policy
         )),
+    }
+
+    if let Some(health_check) = &pool.health_check {
+        let obj = match health_check.as_object() {
+            Some(obj) => obj,
+            None => {
+                errors.push(format!(
+                    "upstream pool {} health_check must be JSON object",
+                    pool.id
+                ));
+                return;
+            }
+        };
+
+        let kind = obj
+            .get("kind")
+            .or_else(|| obj.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("tcp");
+        if !kind.eq_ignore_ascii_case("tcp") {
+            errors.push(format!(
+                "upstream pool {} health_check kind {} not supported",
+                pool.id, kind
+            ));
+        }
+
+        if let Some(v) = obj.get("interval_secs") {
+            match v.as_u64() {
+                Some(0) | None => errors.push(format!(
+                    "upstream pool {} health_check interval_secs must be positive integer",
+                    pool.id
+                )),
+                Some(_) => {}
+            }
+        }
+
+        if let Some(v) = obj.get("timeout_ms") {
+            match v.as_u64() {
+                Some(0) | None => errors.push(format!(
+                    "upstream pool {} health_check timeout_ms must be positive integer",
+                    pool.id
+                )),
+                Some(_) => {}
+            }
+        }
     }
 }
 
@@ -1014,4 +1580,99 @@ fn parse_host_port(address: &str) -> Option<(String, u16)> {
     }
     let port: u16 = port_str.parse().ok()?;
     Some((host.to_string(), port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use gateway_common::snapshot::Snapshot;
+    use gateway_common::state::SnapshotStore;
+    use prometheus::proto::MetricType;
+    use sea_orm::DatabaseConnection;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn acme_challenge_route_uses_brace_params() {
+        let (snapshots, _rx) = SnapshotStore::new(Snapshot::default());
+        let state = AppState {
+            db: DatabaseConnection::default(),
+            snapshots,
+            acme_store: crate::acme::AcmeChallengeStore::default(),
+            http_port_range: None,
+            https_port_range: None,
+        };
+
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/acme/challenge/test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("error").is_some());
+    }
+
+    #[tokio::test]
+    async fn metrics_unmatched_path_is_not_high_cardinality() {
+        let (snapshots, _rx) = SnapshotStore::new(Snapshot::default());
+        let state = AppState {
+            db: DatabaseConnection::default(),
+            snapshots,
+            acme_store: crate::acme::AcmeChallengeStore::default(),
+            http_port_range: None,
+            https_port_range: None,
+        };
+
+        let app = router(state);
+        let random = format!("/__probe/{}-{}", Uuid::new_v4(), Uuid::new_v4());
+        let _ = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(&random)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let families = prometheus::gather();
+        let mut found_unmatched = false;
+
+        for family in families {
+            if family.get_name() != "gateway_control_http_requests_total" {
+                continue;
+            }
+            if family.get_field_type() != MetricType::COUNTER {
+                continue;
+            }
+
+            for metric in family.get_metric() {
+                for label in metric.get_label() {
+                    if label.get_name() == "path" && label.get_value() == random {
+                        panic!("metrics path label leaked raw uri path");
+                    }
+                    if label.get_name() == "path" && label.get_value() == "<unmatched>" {
+                        found_unmatched = true;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            found_unmatched,
+            "expected <unmatched> path label in metrics"
+        );
+    }
 }

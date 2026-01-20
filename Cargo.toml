@@ -20,6 +20,7 @@ chrono = { version = "0.4.43", features = ["serde"] }
 dotenvy = "0.15.7"
 instant-acme = "0.8.4"
 pingora = { version = "0.6.0", features = ["proxy", "openssl"] }
+prometheus = "0.13.4"
 regex = "1.12.2"
 reqwest = { version = "0.13.1", features = ["json"] }
 sea-orm = { version = "1.1.19", features = ["sqlx-postgres", "runtime-tokio-native-tls", "macros", "with-chrono", "with-uuid", "with-json"] }
@@ -28,6 +29,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.12"
 tokio = { version = "1.49.0", features = ["full"] }
+tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.6.8", features = ["trace", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }

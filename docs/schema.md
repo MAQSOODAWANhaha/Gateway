@@ -37,6 +37,10 @@
 - name TEXT NOT NULL
 - policy TEXT NOT NULL  -- round_robin|least_conn|weighted
 - health_check JSONB NULL
+  - 约定结构（当前实现）：
+    - kind/type: "tcp"（默认 tcp）
+    - interval_secs: 正整数（可选，覆盖全局 HEALTH_CHECK_INTERVAL_SECS）
+    - timeout_ms: 正整数（可选，覆盖全局 HEALTH_CHECK_TIMEOUT_MS）
 - created_at TIMESTAMPTZ NOT NULL
 - updated_at TIMESTAMPTZ NOT NULL
 
@@ -65,7 +69,7 @@
 - updated_at TIMESTAMPTZ NOT NULL
 
 索引：
-- GIN(domains)
+- GIN(domains)（索引名：tls_policies_domains_idx）
 
 ## certificates
 - id UUID PK

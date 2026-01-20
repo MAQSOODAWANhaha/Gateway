@@ -57,19 +57,33 @@ Base path: /api/v1
 - invalid protocol
 - https requires tls_policy_id
 - invalid route type / match_expr
+- route conflicts with route (same match conditions)
 - invalid upstream target address
 
 ## 节点
 - POST   /nodes/register
 - POST   /nodes/heartbeat
-- GET    /nodes                节点状态
+- GET    /nodes                节点状态（包含一致性判定）
+
+节点状态字段补充：
+- `published_version_id`：当前已发布版本（可能为空）
+- `consistent`：节点版本是否与已发布一致
 
 ## ACME
 - GET    /acme/challenge/{token}  获取 HTTP-01 challenge
 
 ## 审计与指标
 - GET    /audit                审计日志
-- GET    /metrics              Prometheus 指标
+- GET    /metrics              Prometheus 指标（控制平面）
+
+说明：
+- 审计日志覆盖：发布/回滚 + 配置类资源（监听器/路由/上游池/目标/TLS 策略）的增删改，以及触发续期操作。
+- 审计写入为 best-effort：审计写入失败不会阻挡业务写入/接口成功返回；失败会记录日志，并通过指标 `gateway_control_audit_write_failures_total` 观察。
+
+操作者（actor）：
+- 配置类资源的增删改接口：可通过请求头 `x-actor` 传入操作者标识（可选，缺省为 `unknown`）。
+- `x-actor` 建议进行 URL 编码（ASCII），服务端会做解码与 trim。
+- 发布/回滚接口：请求体包含 `actor` 字段（前端调用使用）。
 
 ## 示例
 

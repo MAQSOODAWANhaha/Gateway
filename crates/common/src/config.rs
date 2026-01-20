@@ -23,6 +23,7 @@ pub struct AppConfig {
     pub database_url: Option<String>,
     pub control_plane_addr: String,
     pub control_plane_url: String,
+    pub data_plane_metrics_addr: String,
     pub node_id: String,
     pub run_control_plane: bool,
     pub run_data_plane: bool,
@@ -57,6 +58,8 @@ impl AppConfig {
             env::var("CONTROL_PLANE_ADDR").unwrap_or_else(|_| "0.0.0.0:9000".to_string());
         let control_plane_url = env::var("CONTROL_PLANE_URL")
             .unwrap_or_else(|_| format!("http://{}", control_plane_addr));
+        let data_plane_metrics_addr =
+            env::var("DATA_PLANE_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:9150".to_string());
         let node_id = env::var("NODE_ID").unwrap_or_else(|_| "gateway-node".to_string());
 
         let poll_interval_secs = env_u64("POLL_INTERVAL_SECS", 5);
@@ -81,6 +84,7 @@ impl AppConfig {
             database_url,
             control_plane_addr,
             control_plane_url,
+            data_plane_metrics_addr,
             node_id,
             run_control_plane,
             run_data_plane,

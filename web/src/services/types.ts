@@ -51,6 +51,8 @@ export type NodeStatus = {
   id: string;
   node_id: string;
   version_id?: string | null;
+  published_version_id?: string | null;
+  consistent?: boolean;
   heartbeat_at: string;
   metadata?: Record<string, unknown> | null;
 };

@@ -1,7 +1,6 @@
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { endpoints } from "@/services/endpoints";
-import type { ConfigVersion } from "@/services/types";
 import { SectionHeader } from "@/components/SectionHeader";
 import { DataTable } from "@/components/DataTable";
 import { Button } from "@/shadcn/ui/button";

@@ -1,4 +1,5 @@
 /target
+web/dist/
 web/node_modules/.package-lock.json
 web/node_modules/.bin/autoprefixer
 web/node_modules/.bin/autoprefixer.cmd

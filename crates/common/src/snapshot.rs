@@ -2,9 +2,9 @@ use crate::entities::{
     certificates, listeners, routes, tls_policies, upstream_pools, upstream_targets,
 };
 use anyhow::Result;
+use sea_orm::DatabaseConnection;
 use sea_orm::{EntityTrait, QueryOrder};
 use serde::{Deserialize, Serialize};
-use sea_orm::DatabaseConnection;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

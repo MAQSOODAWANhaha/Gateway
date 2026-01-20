@@ -72,7 +72,7 @@ export default function Upstreams() {
   });
 
   const createTarget = useMutation({
-    mutationFn: ({ poolId, payload }: { poolId: string; payload: Partial<UpstreamTarget> }) =>
+    mutationFn: ({ poolId, payload }: { poolId: string; payload: Partial<UpstreamTarget> & { address: string } }) =>
       endpoints.targets.create(poolId, payload),
     onSuccess: () => {
       toast.success("目标已创建");

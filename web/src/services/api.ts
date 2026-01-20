@@ -18,9 +18,13 @@ async function parseJsonSafe(resp: Response) {
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const actor =
+    typeof window !== "undefined" ? localStorage.getItem("gateway.actor") : null;
+  const encodedActor = actor ? encodeURIComponent(actor) : null;
   const resp = await fetch(path, {
     headers: {
       "content-type": "application/json",
+      ...(encodedActor ? { "x-actor": encodedActor } : {}),
       ...(init?.headers ?? {})
     },
     ...init
@@ -28,7 +32,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!resp.ok) {
     const payload = await parseJsonSafe(resp);
-    const message = payload?.message ?? resp.statusText;
+    const message = payload?.error ?? payload?.message ?? resp.statusText;
     throw new ApiError(message || "请求失败", resp.status, payload);
   }
 

@@ -4,14 +4,8 @@ use gateway_common::entities::tls_policies::Model as TlsPolicy;
 use gateway_common::snapshot::Snapshot;
 use rcgen::CertificateParams;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use uuid::Uuid;
-
-#[derive(Debug, Clone)]
-struct CertPaths {
-    pub cert_path: PathBuf,
-    pub key_path: PathBuf,
-}
 
 #[derive(Debug, Clone)]
 pub struct TlsKeyPairPem {
@@ -26,33 +20,29 @@ fn select_cert<'a>(policy: &TlsPolicy, certs: &'a [Certificate]) -> Option<&'a C
         .max_by_key(|cert| cert.expires_at)
 }
 
-fn ensure_default_cert(certs_dir: &Path) -> Result<CertPaths> {
+fn read_default_cert_if_present(certs_dir: &Path) -> Result<Option<TlsKeyPairPem>> {
     let cert_path = certs_dir.join("default.pem");
     let key_path = certs_dir.join("default.key");
-    if cert_path.exists() && key_path.exists() {
-        return Ok(CertPaths {
-            cert_path,
-            key_path,
-        });
+    if !cert_path.exists() || !key_path.exists() {
+        return Ok(None);
     }
+    Ok(Some(TlsKeyPairPem {
+        cert_pem: fs::read(cert_path)?,
+        key_pem: fs::read(key_path)?,
+    }))
+}
 
+pub fn default_tls_pem(certs_dir: &Path) -> Result<TlsKeyPairPem> {
+    if let Some(pem) = read_default_cert_if_present(certs_dir)? {
+        return Ok(pem);
+    }
     let mut params = CertificateParams::new(vec!["gateway.local".to_string()])?;
     params.is_ca = rcgen::IsCa::NoCa;
     let key_pair = rcgen::KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
-    fs::write(&cert_path, cert.pem())?;
-    fs::write(&key_path, key_pair.serialize_pem())?;
-    Ok(CertPaths {
-        cert_path,
-        key_path,
-    })
-}
-
-pub fn default_tls_pem(certs_dir: &Path) -> Result<TlsKeyPairPem> {
-    let paths = ensure_default_cert(certs_dir)?;
     Ok(TlsKeyPairPem {
-        cert_pem: fs::read(paths.cert_path)?,
-        key_pem: fs::read(paths.key_path)?,
+        cert_pem: cert.pem().as_bytes().to_vec(),
+        key_pem: key_pair.serialize_pem().as_bytes().to_vec(),
     })
 }
 

@@ -97,6 +97,7 @@ npm run build
 - `DATABASE_URL`：控制平面必填。
 - `CONTROL_PLANE_ADDR`：控制平面监听地址（默认 `0.0.0.0:9000`）。
 - `CONTROL_PLANE_URL`：数据平面访问控制平面的 URL。
+- `DATA_PLANE_METRICS_ADDR`：数据平面 Prometheus 指标监听地址（默认 `127.0.0.1:9150`）。
 - `HTTP_PORT_RANGE` / `HTTPS_PORT_RANGE`：数据平面预绑定端口范围（例如 `20000-20100`、`21000-21100`）。
 - `ACME_ENABLED`、`ACME_CONTACT_EMAIL`：启用 ACME 自动签发。
 

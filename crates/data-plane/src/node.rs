@@ -4,7 +4,7 @@ use gateway_common::state::SnapshotStore;
 use reqwest::Client;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -13,11 +13,7 @@ pub struct NodeRuntime {
     pub current_version: Arc<RwLock<Option<Uuid>>>,
 }
 
-pub async fn start_node_tasks(
-    config: AppConfig,
-    snapshots: SnapshotStore,
-    runtime: NodeRuntime,
-) {
+pub async fn start_node_tasks(config: AppConfig, snapshots: SnapshotStore, runtime: NodeRuntime) {
     let client = Client::new();
     let base = config.control_plane_url.trim_end_matches('/').to_string();
     let node_id = config.node_id.clone();

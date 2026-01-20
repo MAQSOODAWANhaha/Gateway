@@ -2,7 +2,6 @@ import { useQuery } from "@tanstack/react-query";
 import { endpoints } from "@/services/endpoints";
 import { SectionHeader } from "@/components/SectionHeader";
 import { DataTable } from "@/components/DataTable";
-import type { AuditLog } from "@/services/types";
 
 export default function Audit() {
   const audit = useQuery({ queryKey: ["audit"], queryFn: endpoints.audit.list });

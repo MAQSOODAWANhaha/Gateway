@@ -14,12 +14,13 @@
 - `RUN_DATA_PLANE`：是否启动数据平面（默认 true）。
 - `CONTROL_PLANE_ADDR`：控制平面监听地址（默认 `0.0.0.0:9000`）。
 - `CONTROL_PLANE_URL`：控制平面访问 URL（默认 `http://{CONTROL_PLANE_ADDR}`）。
+- `DATA_PLANE_METRICS_ADDR`：数据平面 Prometheus 指标监听地址（默认 `127.0.0.1:9150`）。
 - `NODE_ID`：数据平面节点标识（默认 `gateway-node`）。
 - `POLL_INTERVAL_SECS`：数据平面轮询发布快照间隔（默认 5）。
 - `HEARTBEAT_INTERVAL_SECS`：数据平面心跳间隔（默认 10）。
 - `HEALTH_CHECK_INTERVAL_SECS`：上游健康检查间隔（默认 5）。
 - `HEALTH_CHECK_TIMEOUT_MS`：健康检查超时（默认 800）。
-- `CERTS_DIR`：证书落盘目录（默认 `data/certs`）。
+- `CERTS_DIR`：可选默认证书目录（默认 `data/certs`）。若存在 `default.pem`/`default.key` 则数据平面启动时读取；若不存在则仅在内存生成自签证书兜底。策略证书/私钥不落盘。
 - `HTTP_PORT_RANGE`：数据平面预绑定的 HTTP 端口范围（例如 `20000-20100`，未设置则仅监听已配置监听器端口）。
 - `HTTPS_PORT_RANGE`：数据平面预绑定的 HTTPS 端口范围（例如 `21000-21100`，未设置则仅监听已配置监听器端口）。
 
@@ -64,14 +65,21 @@
 - 回滚：调用 `/api/v1/config/rollback` 并指定 `version_id`。
 - 数据平面只加载已发布版本。
 
+## 指标（Prometheus）
+- 控制平面：`GET /api/v1/metrics`（Prometheus exposition）。
+- 数据平面：监听 `DATA_PLANE_METRICS_ADDR`（默认 `127.0.0.1:9150`）。
+
 ## 失败处理与排查
 - 控制平面无法启动：检查 `DATABASE_URL`、网络与迁移日志。
 - 数据平面拉取失败：检查 `CONTROL_PLANE_URL`、访问权限与网络连通性。
 - 证书签发失败：检查 80 端口可达、域名解析、`ACME_CONTACT_EMAIL`。
 - 路由不生效：确认已发布新版本，数据平面日志中出现快照应用记录。
 - TLS 未启用：确认监听器为 `https` 且绑定有效 `tls_policy_id`。
+- 审计写入失败：不影响业务接口；查看控制平面指标 `gateway_control_audit_write_failures_total` 与控制平面日志。
 
 ## 注意事项
 - HTTP-01 需要外部能够访问 80 端口。
 - 未启用端口段预绑定时：监听器新增/删除需要重启数据平面生效；启用 `HTTP_PORT_RANGE`/`HTTPS_PORT_RANGE` 后可在端口范围内动态新增/启用监听器，无需重启数据平面。
 - 证书热更新不会中断现有 WS 连接。
+- 数据平面仅从已发布快照加载策略证书到内存并热更新，不会将策略证书/私钥落盘。
+- `CERTS_DIR` 仅用于可选提供 `default.pem`/`default.key`（读取后只在内存使用）；若未提供则使用内存自签证书兜底。

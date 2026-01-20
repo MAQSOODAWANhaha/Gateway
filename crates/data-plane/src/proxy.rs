@@ -19,6 +19,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -27,6 +28,11 @@ use uuid::Uuid;
 pub struct ProxyRouter {
     runtime: Arc<RwLock<RuntimeConfig>>,
     acme_client: Option<AcmeChallengeClient>,
+}
+
+pub struct RequestCtx {
+    start: Instant,
+    target: Option<Arc<TargetRuntime>>,
 }
 
 impl ProxyRouter {
@@ -43,11 +49,19 @@ impl ProxyRouter {
 
 #[async_trait]
 impl ProxyHttp for ProxyRouter {
-    type CTX = ();
+    type CTX = RequestCtx;
 
-    fn new_ctx(&self) {}
+    fn new_ctx(&self) -> Self::CTX {
+        RequestCtx {
+            start: Instant::now(),
+            target: None,
+        }
+    }
 
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut ()) -> Result<bool> {
+    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        ctx.start = Instant::now();
+        crate::metrics::inflight_inc();
+
         let path = session.req_header().uri.path();
         if let Some(token) = acme_token_from_path(path)
             && let Some(client) = &self.acme_client
@@ -79,7 +93,11 @@ impl ProxyHttp for ProxyRouter {
         Ok(false)
     }
 
-    async fn upstream_peer(&self, session: &mut Session, _ctx: &mut ()) -> Result<Box<HttpPeer>> {
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
         let header = session.req_header();
         let port = session
             .as_downstream()
@@ -102,7 +120,11 @@ impl ProxyHttp for ProxyRouter {
             if !route.matches(header) {
                 continue;
             }
-            if let Some(peer) = runtime.pick_peer(route.upstream_pool_id) {
+            if let Some((peer, target)) = runtime.pick_peer(route.upstream_pool_id) {
+                if let Some(prev) = ctx.target.take() {
+                    prev.inflight.fetch_sub(1, Ordering::Relaxed);
+                }
+                ctx.target = target;
                 debug!("route matched: {}", route.id);
                 return Ok(peer);
             }
@@ -113,6 +135,30 @@ impl ProxyHttp for ProxyRouter {
             "no upstream matched",
         ))
     }
+
+    async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX)
+    where
+        Self::CTX: Send + Sync,
+    {
+        crate::metrics::inflight_dec();
+
+        let status = session
+            .as_downstream()
+            .response_written()
+            .map(|resp| resp.status.as_u16())
+            .unwrap_or(500);
+        let method = session.req_header().method.as_str();
+        let seconds = ctx.start.elapsed().as_secs_f64();
+        crate::metrics::observe_request(method, status, seconds);
+
+        if e.is_some() {
+            crate::metrics::inc_upstream_error("proxy_error");
+        }
+
+        if let Some(target) = ctx.target.take() {
+            target.inflight.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 pub struct RuntimeConfig {
@@ -121,6 +167,59 @@ pub struct RuntimeConfig {
     pub tls_by_port: HashMap<u16, Arc<TlsKeyPair>>,
     pub routes_by_listener: HashMap<Uuid, Vec<RouteRule>>,
     pools: HashMap<Uuid, PoolRuntime>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoolPolicy {
+    RoundRobin,
+    Weighted,
+    LeastConn,
+}
+
+impl PoolPolicy {
+    fn from_str(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "round_robin" => Some(Self::RoundRobin),
+            "weighted" => Some(Self::Weighted),
+            "least_conn" => Some(Self::LeastConn),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PoolHealthCheck {
+    pub interval_secs: Option<u64>,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PoolHealthCheckInput {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default, rename = "type")]
+    r#type: Option<String>,
+    #[serde(default)]
+    interval_secs: Option<u64>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+impl PoolHealthCheck {
+    fn from_json(value: &JsonValue) -> Option<Self> {
+        let input: PoolHealthCheckInput = serde_json::from_value(value.clone()).ok()?;
+        let kind = input
+            .kind
+            .or(input.r#type)
+            .unwrap_or_else(|| "tcp".to_string());
+        if !kind.eq_ignore_ascii_case("tcp") {
+            return None;
+        }
+        Some(Self {
+            interval_secs: input.interval_secs,
+            timeout_ms: input.timeout_ms,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -301,16 +400,26 @@ impl RouteRule {
 }
 
 pub struct PoolRuntime {
-    targets: Vec<TargetRuntime>,
+    targets: Vec<Arc<TargetRuntime>>,
     cursor: AtomicUsize,
+    policy: PoolPolicy,
+    health: PoolHealthCheck,
 }
 
 impl PoolRuntime {
-    fn pick(&self) -> Option<&UpstreamTarget> {
+    fn pick(&self) -> Option<Arc<TargetRuntime>> {
+        match self.policy {
+            PoolPolicy::RoundRobin => self.pick_round_robin(),
+            PoolPolicy::Weighted => self.pick_weighted(),
+            PoolPolicy::LeastConn => self.pick_least_conn(),
+        }
+    }
+
+    fn pick_weighted(&self) -> Option<Arc<TargetRuntime>> {
         if self.targets.is_empty() {
             return None;
         }
-        let total_all: usize = self.targets.iter().map(TargetRuntime::weight).sum();
+        let total_all: usize = self.targets.iter().map(|t| t.weight()).sum();
         if total_all == 0 {
             return None;
         }
@@ -318,7 +427,7 @@ impl PoolRuntime {
             .targets
             .iter()
             .filter(|t| t.healthy.load(Ordering::Relaxed))
-            .map(TargetRuntime::weight)
+            .map(|t| t.weight())
             .sum();
         let use_all = total_healthy == 0;
         let total_weight = if use_all { total_all } else { total_healthy };
@@ -329,20 +438,76 @@ impl PoolRuntime {
             let healthy = target.healthy.load(Ordering::Relaxed);
             if healthy || use_all {
                 if cursor < weight {
-                    return Some(&target.target);
+                    target.inflight.fetch_add(1, Ordering::Relaxed);
+                    return Some(target.clone());
                 }
                 cursor = cursor.saturating_sub(weight);
             }
         }
-        self.targets.first().map(|t| &t.target)
+        let fallback = self.targets.first().cloned();
+        if let Some(target) = &fallback {
+            target.inflight.fetch_add(1, Ordering::Relaxed);
+        }
+        fallback
     }
 
-    fn set_health(&mut self, target_id: Uuid, healthy: bool) -> bool {
-        if let Some(target) = self.targets.iter_mut().find(|t| t.target.id == target_id) {
-            target.healthy.store(healthy, Ordering::Relaxed);
-            return true;
+    fn pick_round_robin(&self) -> Option<Arc<TargetRuntime>> {
+        let n = self.targets.len();
+        if n == 0 {
+            return None;
         }
-        false
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+
+        for offset in 0..n {
+            let idx = (start + offset) % n;
+            let target = &self.targets[idx];
+            if target.healthy.load(Ordering::Relaxed) {
+                target.inflight.fetch_add(1, Ordering::Relaxed);
+                return Some(target.clone());
+            }
+        }
+
+        let target = self.targets[start].clone();
+        target.inflight.fetch_add(1, Ordering::Relaxed);
+        Some(target)
+    }
+
+    fn pick_least_conn(&self) -> Option<Arc<TargetRuntime>> {
+        let n = self.targets.len();
+        if n == 0 {
+            return None;
+        }
+
+        let min_healthy = self
+            .targets
+            .iter()
+            .filter(|t| t.healthy.load(Ordering::Relaxed))
+            .map(|t| t.inflight.load(Ordering::Relaxed))
+            .min();
+        let use_all = min_healthy.is_none();
+        let min_inflight = if use_all {
+            self.targets
+                .iter()
+                .map(|t| t.inflight.load(Ordering::Relaxed))
+                .min()
+        } else {
+            min_healthy
+        }?;
+
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        for offset in 0..n {
+            let idx = (start + offset) % n;
+            let target = &self.targets[idx];
+            let ok = use_all || target.healthy.load(Ordering::Relaxed);
+            if ok && target.inflight.load(Ordering::Relaxed) == min_inflight {
+                target.inflight.fetch_add(1, Ordering::Relaxed);
+                return Some(target.clone());
+            }
+        }
+
+        let target = self.targets[start].clone();
+        target.inflight.fetch_add(1, Ordering::Relaxed);
+        Some(target)
     }
 }
 
@@ -354,18 +519,32 @@ pub fn build_runtime(
 ) -> AnyResult<RuntimeConfig> {
     let mut pools = HashMap::new();
     for pool in &snapshot.upstream_pools {
-        let targets: Vec<TargetRuntime> = snapshot
+        let targets: Vec<Arc<TargetRuntime>> = snapshot
             .upstream_targets
             .iter()
             .filter(|t| t.pool_id == pool.id && t.enabled)
             .cloned()
-            .map(|target| TargetRuntime::new(target, true))
+            .map(|target| Arc::new(TargetRuntime::new(target, true)))
             .collect();
+        let policy = PoolPolicy::from_str(&pool.policy).unwrap_or_else(|| {
+            warn!("invalid pool policy {} for pool {}", pool.policy, pool.id);
+            PoolPolicy::Weighted
+        });
+        let health = pool
+            .health_check
+            .as_ref()
+            .and_then(PoolHealthCheck::from_json)
+            .unwrap_or(PoolHealthCheck {
+                interval_secs: None,
+                timeout_ms: None,
+            });
         pools.insert(
             pool.id,
             PoolRuntime {
                 targets,
                 cursor: AtomicUsize::new(0),
+                policy,
+                health,
             },
         );
     }
@@ -419,42 +598,42 @@ pub fn build_runtime(
             }
             let port = l.port as u16;
             if l.protocol.eq_ignore_ascii_case("https") {
-                if let Some(range) = https_port_range {
-                    if !range.contains(port) {
-                        warn!(
-                            "https listener {} port {} outside HTTPS_PORT_RANGE",
-                            l.id, port
-                        );
-                        return false;
-                    }
+                if let Some(range) = https_port_range
+                    && !range.contains(port)
+                {
+                    warn!(
+                        "https listener {} port {} outside HTTPS_PORT_RANGE",
+                        l.id, port
+                    );
+                    return false;
                 }
-                if let Some(range) = http_port_range {
-                    if range.contains(port) {
-                        warn!(
-                            "https listener {} port {} conflicts with HTTP_PORT_RANGE",
-                            l.id, port
-                        );
-                        return false;
-                    }
+                if let Some(range) = http_port_range
+                    && range.contains(port)
+                {
+                    warn!(
+                        "https listener {} port {} conflicts with HTTP_PORT_RANGE",
+                        l.id, port
+                    );
+                    return false;
                 }
             } else {
-                if let Some(range) = http_port_range {
-                    if !range.contains(port) {
-                        warn!(
-                            "http listener {} port {} outside HTTP_PORT_RANGE",
-                            l.id, port
-                        );
-                        return false;
-                    }
+                if let Some(range) = http_port_range
+                    && !range.contains(port)
+                {
+                    warn!(
+                        "http listener {} port {} outside HTTP_PORT_RANGE",
+                        l.id, port
+                    );
+                    return false;
                 }
-                if let Some(range) = https_port_range {
-                    if range.contains(port) {
-                        warn!(
-                            "http listener {} port {} conflicts with HTTPS_PORT_RANGE",
-                            l.id, port
-                        );
-                        return false;
-                    }
+                if let Some(range) = https_port_range
+                    && range.contains(port)
+                {
+                    warn!(
+                        "http listener {} port {} conflicts with HTTPS_PORT_RANGE",
+                        l.id, port
+                    );
+                    return false;
                 }
             }
             true
@@ -518,33 +697,22 @@ pub fn build_runtime(
 }
 
 impl RuntimeConfig {
-    pub fn pick_peer(&self, pool_id: Uuid) -> Option<Box<HttpPeer>> {
+    pub fn pick_peer(&self, pool_id: Uuid) -> Option<(Box<HttpPeer>, Option<Arc<TargetRuntime>>)> {
         let pool = self.pools.get(&pool_id)?;
         let target = pool.pick()?;
-        Some(Box::new(HttpPeer::new(
-            target.address.clone(),
+        let peer = Box::new(HttpPeer::new(
+            target.target.address.clone(),
             false,
             String::new(),
-        )))
+        ));
+        Some((peer, Some(target)))
     }
 
-    pub fn all_targets(&self) -> Vec<UpstreamTarget> {
-        let mut targets = Vec::new();
-        for pool in self.pools.values() {
-            for target in &pool.targets {
-                targets.push(target.target.clone());
-            }
-        }
-        targets
-    }
-
-    pub fn set_target_health(&mut self, target_id: Uuid, healthy: bool) -> bool {
-        for pool in self.pools.values_mut() {
-            if pool.set_health(target_id, healthy) {
-                return true;
-            }
-        }
-        false
+    pub fn health_pools(&self) -> Vec<(Uuid, PoolHealthCheck, Vec<Arc<TargetRuntime>>)> {
+        self.pools
+            .iter()
+            .map(|(id, pool)| (*id, pool.health.clone(), pool.targets.clone()))
+            .collect()
     }
 }
 
@@ -603,9 +771,10 @@ fn parse_tls_keypair(pem: &TlsKeyPairPem) -> AnyResult<TlsKeyPair> {
     Ok(TlsKeyPair { leaf, chain, key })
 }
 
-struct TargetRuntime {
+pub struct TargetRuntime {
     target: UpstreamTarget,
     healthy: AtomicBool,
+    inflight: AtomicUsize,
 }
 
 impl TargetRuntime {
@@ -613,11 +782,20 @@ impl TargetRuntime {
         Self {
             target,
             healthy: AtomicBool::new(healthy),
+            inflight: AtomicUsize::new(0),
         }
     }
 
     fn weight(&self) -> usize {
         self.target.weight.max(1) as usize
+    }
+
+    pub fn address(&self) -> &str {
+        &self.target.address
+    }
+
+    pub fn set_healthy(&self, healthy: bool) {
+        self.healthy.store(healthy, Ordering::Relaxed);
     }
 }
 

@@ -126,12 +126,7 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(Routes::Table)
                     .if_not_exists()
-                    .col(
-                        ColumnDef::new(Routes::Id)
-                            .uuid()
-                            .not_null()
-                            .primary_key(),
-                    )
+                    .col(ColumnDef::new(Routes::Id).uuid().not_null().primary_key())
                     .col(ColumnDef::new(Routes::ListenerId).uuid().not_null())
                     .col(ColumnDef::new(Routes::Type).string().not_null())
                     .col(ColumnDef::new(Routes::MatchExpr).json_binary().not_null())
@@ -251,9 +246,17 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(ConfigVersions::SnapshotJson).json_binary().not_null())
+                    .col(
+                        ColumnDef::new(ConfigVersions::SnapshotJson)
+                            .json_binary()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(ConfigVersions::Status).string().not_null())
-                    .col(ColumnDef::new(ConfigVersions::CreatedBy).string().not_null())
+                    .col(
+                        ColumnDef::new(ConfigVersions::CreatedBy)
+                            .string()
+                            .not_null(),
+                    )
                     .col(
                         ColumnDef::new(ConfigVersions::CreatedAt)
                             .timestamp_with_time_zone()
@@ -496,7 +499,9 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager.drop_table(Table::drop().table(AuditLogs::Table).to_owned()).await?;
+        manager
+            .drop_table(Table::drop().table(AuditLogs::Table).to_owned())
+            .await?;
         manager
             .drop_table(Table::drop().table(NodeStatus::Table).to_owned())
             .await?;

@@ -17,7 +17,11 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(AcmeAccounts::DirectoryUrl).string().not_null())
+                    .col(
+                        ColumnDef::new(AcmeAccounts::DirectoryUrl)
+                            .string()
+                            .not_null(),
+                    )
                     .col(
                         ColumnDef::new(AcmeAccounts::CredentialsJson)
                             .json_binary()

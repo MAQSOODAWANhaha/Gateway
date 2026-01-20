@@ -1,7 +1,7 @@
+use anyhow::{Result, anyhow};
+use chrono::{DateTime, Duration, Utc};
 use gateway_common::config::AppConfig;
 use gateway_common::entities::{acme_accounts, certificates, tls_policies};
-use anyhow::{anyhow, Result};
-use chrono::{DateTime, Duration, Utc};
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
     NewOrder, OrderStatus, RetryPolicy,
@@ -49,7 +49,11 @@ pub async fn run_acme_worker(
 
     let contact_email = match &config.acme_contact_email {
         Some(email) => email.clone(),
-        None => return Err(anyhow!("ACME_CONTACT_EMAIL is required when ACME is enabled")),
+        None => {
+            return Err(anyhow!(
+                "ACME_CONTACT_EMAIL is required when ACME is enabled"
+            ));
+        }
     };
 
     fs::create_dir_all(&config.acme_storage_dir)?;
@@ -162,13 +166,8 @@ async fn order_certificate_inner(
     store: &AcmeChallengeStore,
     domains: &[String],
 ) -> Result<(String, String, DateTime<Utc>)> {
-    let identifiers: Vec<Identifier> = domains
-        .iter()
-        .map(|d| Identifier::Dns(d.clone()))
-        .collect();
-    let mut order = account
-        .new_order(&NewOrder::new(&identifiers))
-        .await?;
+    let identifiers: Vec<Identifier> = domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
+    let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
 
     let mut authorizations = order.authorizations();
     while let Some(result) = authorizations.next().await {
