@@ -104,10 +104,10 @@ impl AppConfig {
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
-    match env::var(key) {
-        Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
-        Err(_) => default,
-    }
+    env::var(key)
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(default)
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -122,22 +122,27 @@ fn env_port_range(key: &str) -> Result<Option<PortRange>> {
         Ok(v) => v.trim().to_string(),
         Err(_) => return Ok(None),
     };
+
     if raw.is_empty() {
         return Ok(None);
     }
-    let (start, end) = raw
+
+    let (start_str, end_str) = raw
         .split_once('-')
         .ok_or_else(|| anyhow!("{} must be in form start-end", key))?;
-    let start: u16 = start
+
+    let start: u16 = start_str
         .trim()
         .parse()
         .map_err(|_| anyhow!("{} invalid start port", key))?;
-    let end: u16 = end
+    let end: u16 = end_str
         .trim()
         .parse()
         .map_err(|_| anyhow!("{} invalid end port", key))?;
+
     if start == 0 || end == 0 || start > end {
         return Err(anyhow!("{} invalid range {}-{}", key, start, end));
     }
+
     Ok(Some(PortRange { start, end }))
 }

@@ -66,7 +66,6 @@ pub async fn metrics_middleware(req: Request<Body>, next: Next) -> Response {
     let start = Instant::now();
     let response = next.run(req).await;
     let elapsed = start.elapsed().as_secs_f64();
-
     let status = response.status().as_u16().to_string();
 
     if let Ok(counter) = http_requests_total() {

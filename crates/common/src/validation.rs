@@ -5,6 +5,7 @@
 use crate::config::PortRange;
 use crate::snapshot::Snapshot;
 use std::collections::HashSet;
+use uuid::Uuid;
 
 /// 验证错误类型
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,7 +214,6 @@ impl ValidationContext {
 
     /// 检查单个监听器是否有效（用于 data-plane 运行时过滤）
     pub fn is_listener_valid(&self, listener: &crate::entities::listeners::Model) -> bool {
-        // 检查端口范围
         if !(1..=65535).contains(&listener.port) {
             tracing::warn!(
                 "invalid listener port {} for listener {}",
@@ -226,50 +226,61 @@ impl ValidationContext {
         let port = listener.port as u16;
         let is_https = listener.protocol.eq_ignore_ascii_case("https");
 
+        // 检查端口范围有效性
         if is_https {
-            if let Some(range) = self.https_port_range
-                && !range.contains(port)
-            {
-                tracing::warn!(
-                    "https listener {} port {} outside HTTPS_PORT_RANGE",
-                    listener.id,
-                    port
-                );
-                return false;
-            }
-            if let Some(range) = self.http_port_range
-                && range.contains(port)
-            {
-                tracing::warn!(
-                    "https listener {} port {} conflicts with HTTP_PORT_RANGE",
-                    listener.id,
-                    port
-                );
-                return false;
-            }
+            self.check_https_listener_port(listener.id, port)
         } else {
-            if let Some(range) = self.http_port_range
-                && !range.contains(port)
-            {
-                tracing::warn!(
-                    "http listener {} port {} outside HTTP_PORT_RANGE",
-                    listener.id,
-                    port
-                );
-                return false;
-            }
-            if let Some(range) = self.https_port_range
-                && range.contains(port)
-            {
-                tracing::warn!(
-                    "http listener {} port {} conflicts with HTTPS_PORT_RANGE",
-                    listener.id,
-                    port
-                );
-                return false;
-            }
+            self.check_http_listener_port(listener.id, port)
         }
+    }
 
+    /// 检查 HTTPS 监听器端口是否有效
+    fn check_https_listener_port(&self, listener_id: Uuid, port: u16) -> bool {
+        if let Some(range) = self.https_port_range
+            && !range.contains(port)
+        {
+            tracing::warn!(
+                "https listener {} port {} outside HTTPS_PORT_RANGE",
+                listener_id,
+                port
+            );
+            return false;
+        }
+        if let Some(range) = self.http_port_range
+            && range.contains(port)
+        {
+            tracing::warn!(
+                "https listener {} port {} conflicts with HTTP_PORT_RANGE",
+                listener_id,
+                port
+            );
+            return false;
+        }
+        true
+    }
+
+    /// 检查 HTTP 监听器端口是否有效
+    fn check_http_listener_port(&self, listener_id: Uuid, port: u16) -> bool {
+        if let Some(range) = self.http_port_range
+            && !range.contains(port)
+        {
+            tracing::warn!(
+                "http listener {} port {} outside HTTP_PORT_RANGE",
+                listener_id,
+                port
+            );
+            return false;
+        }
+        if let Some(range) = self.https_port_range
+            && range.contains(port)
+        {
+            tracing::warn!(
+                "http listener {} port {} conflicts with HTTPS_PORT_RANGE",
+                listener_id,
+                port
+            );
+            return false;
+        }
         true
     }
 }

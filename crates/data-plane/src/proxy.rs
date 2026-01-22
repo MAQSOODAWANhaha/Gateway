@@ -216,9 +216,11 @@ impl PoolHealthCheck {
             .kind
             .or(input.r#type)
             .unwrap_or_else(|| "tcp".to_string());
+
         if !kind.eq_ignore_ascii_case("tcp") {
             return None;
         }
+
         Some(Self {
             interval_secs: input.interval_secs,
             timeout_ms: input.timeout_ms,
@@ -309,10 +311,8 @@ impl RouteKind {
 impl RouteMatcher {
     pub fn from_json(value: &JsonValue) -> Option<Self> {
         let parsed: RouteMatch = serde_json::from_value(value.clone()).ok()?;
-        let path_regex = match parsed.path_regex {
-            Some(expr) => Regex::new(&expr).ok(),
-            None => None,
-        };
+        let path_regex = parsed.path_regex.and_then(|expr| Regex::new(&expr).ok());
+
         Some(Self {
             host: parsed.host,
             path_prefix: parsed.path_prefix,

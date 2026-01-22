@@ -15,8 +15,8 @@ pub struct NodeRuntime {
 
 pub async fn start_node_tasks(config: AppConfig, snapshots: SnapshotStore, runtime: NodeRuntime) {
     let client = Client::new();
-    let base = config.control_plane_url.trim_end_matches('/').to_string();
-    let node_id = config.node_id.clone();
+    let base = config.control_plane_url.trim_end_matches('/');
+    let node_id = &config.node_id;
 
     let poll_interval = Duration::from_secs(config.poll_interval_secs.max(2));
     let heartbeat_interval = Duration::from_secs(config.heartbeat_interval_secs.max(2));
@@ -25,7 +25,7 @@ pub async fn start_node_tasks(config: AppConfig, snapshots: SnapshotStore, runti
         let client = client.clone();
         let snapshots = snapshots.clone();
         let runtime = runtime.clone();
-        let base = base.clone();
+        let base = base.to_string();
         async move {
             loop {
                 let url = format!("{}/api/v1/config/published", base);
@@ -59,8 +59,7 @@ pub async fn start_node_tasks(config: AppConfig, snapshots: SnapshotStore, runti
     let heartbeat = {
         let client = client.clone();
         let runtime = runtime.clone();
-        let base = base.clone();
-        let node_id = node_id.clone();
+        let base = base.to_string();
         async move {
             let url = format!("{}/api/v1/nodes/heartbeat", base);
             loop {
@@ -70,8 +69,7 @@ pub async fn start_node_tasks(config: AppConfig, snapshots: SnapshotStore, runti
                     "version_id": version_id,
                     "metadata": null
                 });
-                let result = client.post(&url).json(&payload).send().await;
-                if let Err(err) = result {
+                if let Err(err) = client.post(&url).json(&payload).send().await {
                     warn!("heartbeat error: {}", err);
                 }
                 sleep(heartbeat_interval).await;
@@ -82,8 +80,7 @@ pub async fn start_node_tasks(config: AppConfig, snapshots: SnapshotStore, runti
     let register = {
         let client = client.clone();
         let runtime = runtime.clone();
-        let base = base.clone();
-        let node_id = node_id.clone();
+        let base = base.to_string();
         async move {
             let url = format!("{}/api/v1/nodes/register", base);
             let version_id = *runtime.current_version.read().await;

@@ -267,18 +267,9 @@ mod tests {
 
     #[test]
     fn test_gateway_error_http_status_codes() {
-        assert_eq!(
-            GatewayError::NotFound("test".to_string()).http_status_code(),
-            404
-        );
-        assert_eq!(
-            GatewayError::BadRequest("test".to_string()).http_status_code(),
-            400
-        );
-        assert_eq!(
-            GatewayError::Validation("test".to_string()).http_status_code(),
-            400
-        );
+        assert_eq!(GatewayError::not_found("test").http_status_code(), 404);
+        assert_eq!(GatewayError::bad_request("test").http_status_code(), 400);
+        assert_eq!(GatewayError::validation("test").http_status_code(), 400);
         assert_eq!(
             GatewayError::Database(sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
                 "test".to_string()
@@ -286,18 +277,9 @@ mod tests {
             .http_status_code(),
             500
         );
-        assert_eq!(
-            GatewayError::Acme("test".to_string()).http_status_code(),
-            500
-        );
-        assert_eq!(
-            GatewayError::Tls("test".to_string()).http_status_code(),
-            500
-        );
-        assert_eq!(
-            GatewayError::Proxy("test".to_string()).http_status_code(),
-            500
-        );
+        assert_eq!(GatewayError::acme("test").http_status_code(), 500);
+        assert_eq!(GatewayError::tls("test").http_status_code(), 500);
+        assert_eq!(GatewayError::proxy("test").http_status_code(), 500);
         assert_eq!(
             GatewayError::Pingora("test".to_string()).http_status_code(),
             500
@@ -333,35 +315,35 @@ mod tests {
 
     #[test]
     fn test_gateway_error_classification() {
-        assert!(GatewayError::NotFound("test".to_string()).is_client_error());
-        assert!(GatewayError::BadRequest("test".to_string()).is_client_error());
-        assert!(GatewayError::Validation("test".to_string()).is_client_error());
+        assert!(GatewayError::not_found("test").is_client_error());
+        assert!(GatewayError::bad_request("test").is_client_error());
+        assert!(GatewayError::validation("test").is_client_error());
         assert!(
             !GatewayError::Database(sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
                 "test".to_string()
             )))
             .is_client_error()
         );
-        assert!(!GatewayError::Acme("test".to_string()).is_client_error());
-        assert!(!GatewayError::Tls("test".to_string()).is_client_error());
-        assert!(!GatewayError::Proxy("test".to_string()).is_client_error());
+        assert!(!GatewayError::acme("test").is_client_error());
+        assert!(!GatewayError::tls("test").is_client_error());
+        assert!(!GatewayError::proxy("test").is_client_error());
         assert!(!GatewayError::Pingora("test".to_string()).is_client_error());
     }
 
     #[test]
     fn test_gateway_error_is_server_error() {
-        assert!(!GatewayError::NotFound("test".to_string()).is_server_error());
-        assert!(!GatewayError::BadRequest("test".to_string()).is_server_error());
-        assert!(!GatewayError::Validation("test".to_string()).is_server_error());
+        assert!(!GatewayError::not_found("test").is_server_error());
+        assert!(!GatewayError::bad_request("test").is_server_error());
+        assert!(!GatewayError::validation("test").is_server_error());
         assert!(
             GatewayError::Database(sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
                 "test".to_string()
             )))
             .is_server_error()
         );
-        assert!(GatewayError::Acme("test".to_string()).is_server_error());
-        assert!(GatewayError::Tls("test".to_string()).is_server_error());
-        assert!(GatewayError::Proxy("test".to_string()).is_server_error());
+        assert!(GatewayError::acme("test").is_server_error());
+        assert!(GatewayError::tls("test").is_server_error());
+        assert!(GatewayError::proxy("test").is_server_error());
         assert!(GatewayError::Pingora("test".to_string()).is_server_error());
     }
 
@@ -413,15 +395,15 @@ mod tests {
         use axum::http::StatusCode;
 
         assert_eq!(
-            GatewayError::NotFound("test".to_string()).axum_status_code(),
+            GatewayError::not_found("test").axum_status_code(),
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            GatewayError::BadRequest("test".to_string()).axum_status_code(),
+            GatewayError::bad_request("test").axum_status_code(),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            GatewayError::Validation("test".to_string()).axum_status_code(),
+            GatewayError::validation("test").axum_status_code(),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(

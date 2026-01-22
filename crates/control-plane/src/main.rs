@@ -81,10 +81,8 @@ async fn load_latest_snapshot(db: &DatabaseConnection) -> Result<Snapshot> {
         .one(db)
         .await?;
 
-    if let Some(version) = version {
-        let snapshot: Snapshot = serde_json::from_value(version.snapshot_json)?;
-        Ok(snapshot)
-    } else {
-        build_snapshot(db).await
+    match version {
+        Some(v) => Ok(serde_json::from_value(v.snapshot_json)?),
+        None => build_snapshot(db).await,
     }
 }

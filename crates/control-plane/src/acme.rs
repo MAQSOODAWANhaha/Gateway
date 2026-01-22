@@ -205,12 +205,12 @@ async fn latest_cert_expiry(
     domains: &[String],
 ) -> Result<Option<DateTime<Utc>>> {
     for domain in domains {
-        let row = certificates::Entity::find()
+        if let Some(model) = certificates::Entity::find()
             .filter(certificates::Column::Domain.eq(domain))
             .order_by_desc(certificates::Column::ExpiresAt)
             .one(db)
-            .await?;
-        if let Some(model) = row {
+            .await?
+        {
             return Ok(Some(model.expires_at.into()));
         }
     }

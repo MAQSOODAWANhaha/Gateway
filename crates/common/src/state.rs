@@ -20,7 +20,8 @@ impl SnapshotStore {
     }
 
     pub async fn apply(&self, snapshot: Snapshot) -> Result<()> {
-        *self.current.write().await = snapshot.clone();
+        let cloned = snapshot.clone();
+        *self.current.write().await = cloned;
         let _ = self.tx.send(snapshot);
         Ok(())
     }

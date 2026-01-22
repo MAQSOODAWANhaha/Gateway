@@ -41,8 +41,8 @@ pub fn default_tls_pem(certs_dir: &Path) -> Result<TlsKeyPairPem> {
     let key_pair = rcgen::KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
     Ok(TlsKeyPairPem {
-        cert_pem: cert.pem().as_bytes().to_vec(),
-        key_pem: key_pair.serialize_pem().as_bytes().to_vec(),
+        cert_pem: cert.pem().into_bytes(),
+        key_pem: key_pair.serialize_pem().into_bytes(),
     })
 }
 
@@ -50,7 +50,7 @@ pub fn tls_pem_for_policy(snapshot: &Snapshot, policy_id: Uuid) -> Option<TlsKey
     let policy = snapshot.tls_policies.iter().find(|p| p.id == policy_id)?;
     let cert = select_cert(policy, &snapshot.certificates)?;
     Some(TlsKeyPairPem {
-        cert_pem: cert.cert_pem.as_bytes().to_vec(),
-        key_pem: cert.key_pem.as_bytes().to_vec(),
+        cert_pem: cert.cert_pem.clone().into_bytes(),
+        key_pem: cert.key_pem.clone().into_bytes(),
     })
 }

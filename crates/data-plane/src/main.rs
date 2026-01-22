@@ -87,6 +87,7 @@ async fn main() -> Result<()> {
     let router = proxy::ProxyRouter::new(runtime.clone(), Some(acme_client.clone()));
     let mut service = http_proxy_service(&server.configuration, router);
 
+    // 绑定端口范围预绑定
     if let Some(range) = http_port_range {
         for port in range.iter() {
             let addr = format!("0.0.0.0:{}", port);
@@ -112,6 +113,7 @@ async fn main() -> Result<()> {
         );
     }
 
+    // 如果未使用端口范围预绑定，则从快照中绑定监听器
     if http_port_range.is_none() && https_port_range.is_none() {
         let listeners = runtime.read().await.listeners.clone();
         if listeners.is_empty() {

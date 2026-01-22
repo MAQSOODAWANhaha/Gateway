@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use gateway_common::{GatewayError, Result};
+use gateway_common::{GatewayError, Result, ValidationContext};
 
 // 导入事务辅助宏
 use crate::{txn, txn_with};
@@ -113,20 +113,15 @@ async fn create_listener(
     Json(payload): Json<CreateListener>,
 ) -> Result<Json<ListenerModel>> {
     let actor = actor_from_headers(&headers);
-    let enabled = payload.enabled.unwrap_or(true);
-    let name = payload.name;
-    let port = payload.port;
-    let protocol = payload.protocol;
-    let tls_policy_id = payload.tls_policy_id;
 
     let listener = txn!(&state.db, |txn| {
         let active = listeners::ActiveModel {
             id: Set(Uuid::new_v4()),
-            name: Set(name),
-            port: Set(port),
-            protocol: Set(protocol),
-            tls_policy_id: Set(tls_policy_id),
-            enabled: Set(enabled),
+            name: Set(payload.name),
+            port: Set(payload.port),
+            protocol: Set(payload.protocol),
+            tls_policy_id: Set(payload.tls_policy_id),
+            enabled: Set(payload.enabled.unwrap_or(true)),
             ..Default::default()
         };
         Ok::<_, GatewayError>(active.insert(txn).await?)
@@ -157,7 +152,7 @@ async fn get_listener(
     let listener = listeners::Entity::find_by_id(id)
         .one(&state.db)
         .await?
-        .ok_or_else(|| GatewayError::NotFound("listener not found".to_string()))?;
+        .ok_or_else(|| GatewayError::not_found("listener not found"))?;
     Ok(Json(listener))
 }
 
@@ -175,7 +170,7 @@ async fn update_listener(
             let listener = listeners::Entity::find_by_id(id)
                 .one(txn)
                 .await?
-                .ok_or_else(|| GatewayError::NotFound("listener not found".to_string()))?;
+                .ok_or_else(|| GatewayError::not_found("listener not found"))?;
 
             let before = listener.clone();
             let mut active: listeners::ActiveModel = listener.into();
@@ -240,26 +235,19 @@ async fn create_route(
     Json(payload): Json<CreateRoute>,
 ) -> Result<Json<RouteModel>> {
     let actor = actor_from_headers(&headers);
-    let enabled = payload.enabled.unwrap_or(true);
-    let listener_id = payload.listener_id;
-    let r#type = payload.r#type;
-    let match_expr = payload.match_expr;
-    let priority = payload.priority;
-    let upstream_pool_id = payload.upstream_pool_id;
 
     let route = txn!(&state.db, |txn| {
         let active = routes::ActiveModel {
             id: Set(Uuid::new_v4()),
-            listener_id: Set(listener_id),
-            r#type: Set(r#type),
-            match_expr: Set(match_expr),
-            priority: Set(priority),
-            upstream_pool_id: Set(upstream_pool_id),
-            enabled: Set(enabled),
+            listener_id: Set(payload.listener_id),
+            r#type: Set(payload.r#type),
+            match_expr: Set(payload.match_expr),
+            priority: Set(payload.priority),
+            upstream_pool_id: Set(payload.upstream_pool_id),
+            enabled: Set(payload.enabled.unwrap_or(true)),
             ..Default::default()
         };
-        let route = active.insert(txn).await?;
-        Ok::<_, anyhow::Error>(route)
+        Ok::<_, anyhow::Error>(active.insert(txn).await?)
     })?;
 
     spawn_audit(
@@ -291,7 +279,7 @@ async fn get_route(
     let route = routes::Entity::find_by_id(id)
         .one(&state.db)
         .await?
-        .ok_or_else(|| GatewayError::NotFound("route not found".to_string()))?;
+        .ok_or_else(|| GatewayError::not_found("route not found"))?;
     Ok(Json(route))
 }
 
@@ -308,7 +296,7 @@ async fn update_route(
             let route = routes::Entity::find_by_id(id)
                 .one(txn)
                 .await?
-                .ok_or_else(|| GatewayError::NotFound("route not found".to_string()))?;
+                .ok_or_else(|| GatewayError::not_found("route not found"))?;
 
             let before = route.clone();
             let mut active: routes::ActiveModel = route.into();
@@ -374,20 +362,16 @@ async fn create_pool(
     Json(payload): Json<CreateUpstreamPool>,
 ) -> Result<Json<UpstreamPoolModel>> {
     let actor = actor_from_headers(&headers);
-    let name = payload.name;
-    let policy = payload.policy;
-    let health_check = payload.health_check;
 
     let pool = txn!(&state.db, |txn| {
         let active = upstream_pools::ActiveModel {
             id: Set(Uuid::new_v4()),
-            name: Set(name),
-            policy: Set(policy),
-            health_check: Set(health_check),
+            name: Set(payload.name),
+            policy: Set(payload.policy),
+            health_check: Set(payload.health_check),
             ..Default::default()
         };
-        let pool = active.insert(txn).await?;
-        Ok::<_, anyhow::Error>(pool)
+        Ok::<_, anyhow::Error>(active.insert(txn).await?)
     })?;
 
     spawn_audit(
@@ -412,7 +396,7 @@ async fn get_pool(
     let pool = upstream_pools::Entity::find_by_id(id)
         .one(&state.db)
         .await?
-        .ok_or_else(|| GatewayError::NotFound("upstream pool not found".to_string()))?;
+        .ok_or_else(|| GatewayError::not_found("upstream pool not found"))?;
     Ok(Json(pool))
 }
 
@@ -429,7 +413,7 @@ async fn update_pool(
             let pool = upstream_pools::Entity::find_by_id(id)
                 .one(txn)
                 .await?
-                .ok_or_else(|| GatewayError::NotFound("upstream pool not found".to_string()))?;
+                .ok_or_else(|| GatewayError::not_found("upstream pool not found"))?;
 
             let before = pool.clone();
             let mut active: upstream_pools::ActiveModel = pool.into();
@@ -490,21 +474,17 @@ async fn create_target(
     Json(payload): Json<CreateUpstreamTarget>,
 ) -> Result<Json<UpstreamTargetModel>> {
     let actor = actor_from_headers(&headers);
-    let weight = payload.weight.unwrap_or(1);
-    let enabled = payload.enabled.unwrap_or(true);
-    let address = payload.address;
 
     let target = txn!(&state.db, |txn| {
         let active = upstream_targets::ActiveModel {
             id: Set(Uuid::new_v4()),
             pool_id: Set(id),
-            address: Set(address),
-            weight: Set(weight),
-            enabled: Set(enabled),
+            address: Set(payload.address),
+            weight: Set(payload.weight.unwrap_or(1)),
+            enabled: Set(payload.enabled.unwrap_or(true)),
             ..Default::default()
         };
-        let target = active.insert(txn).await?;
-        Ok::<_, anyhow::Error>(target)
+        Ok::<_, anyhow::Error>(active.insert(txn).await?)
     })?;
 
     spawn_audit(
@@ -530,7 +510,7 @@ async fn update_target(
             let target = upstream_targets::Entity::find_by_id(id)
                 .one(txn)
                 .await?
-                .ok_or_else(|| GatewayError::NotFound("upstream target not found".to_string()))?;
+                .ok_or_else(|| GatewayError::not_found("upstream target not found"))?;
 
             let before = target.clone();
             let mut active: upstream_targets::ActiveModel = target.into();
@@ -607,19 +587,16 @@ async fn create_tls_policy(
     Json(payload): Json<CreateTlsPolicy>,
 ) -> Result<Json<TlsPolicyModel>> {
     let actor = actor_from_headers(&headers);
-    let mode = payload.mode;
-    let domains = payload.domains;
 
     let tls = txn!(&state.db, |txn| {
         let active = tls_policies::ActiveModel {
             id: Set(Uuid::new_v4()),
-            mode: Set(mode),
-            domains: Set(domains),
+            mode: Set(payload.mode),
+            domains: Set(payload.domains),
             status: Set("pending".to_string()),
             ..Default::default()
         };
-        let tls = active.insert(txn).await?;
-        Ok::<_, anyhow::Error>(tls)
+        Ok::<_, anyhow::Error>(active.insert(txn).await?)
     })?;
 
     spawn_audit(
@@ -650,7 +627,7 @@ async fn update_tls_policy(
             let tls = tls_policies::Entity::find_by_id(id)
                 .one(txn)
                 .await?
-                .ok_or_else(|| GatewayError::NotFound("tls policy not found".to_string()))?;
+                .ok_or_else(|| GatewayError::not_found("tls policy not found"))?;
 
             let before = tls.clone();
             let mut active: tls_policies::ActiveModel = tls.into();
@@ -730,13 +707,15 @@ struct ValidateResponse {
 
 async fn validate_config(State(state): State<AppState>) -> Result<Json<ValidateResponse>> {
     let snapshot = build_snapshot(&state.db).await?;
-    let mut errors = Vec::new();
-    validate_snapshot(
-        &snapshot,
-        &mut errors,
-        state.http_port_range,
-        state.https_port_range,
-    );
+
+    let validation_ctx = ValidationContext::new(state.http_port_range, state.https_port_range);
+    let validation_errors = validation_ctx.validate_snapshot(&snapshot);
+
+    let mut errors: Vec<String> = validation_errors.iter().map(|e| e.description()).collect();
+
+    // 添加业务逻辑验证
+    validate_snapshot_business_rules(&snapshot, &mut errors);
+
     Ok(Json(ValidateResponse {
         valid: errors.is_empty(),
         errors,
@@ -748,13 +727,15 @@ async fn publish_config(
     Json(payload): Json<PublishRequest>,
 ) -> Result<Json<ConfigVersionModel>> {
     let snapshot = build_snapshot(&state.db).await?;
-    let mut errors = Vec::new();
-    validate_snapshot(
-        &snapshot,
-        &mut errors,
-        state.http_port_range,
-        state.https_port_range,
-    );
+
+    let validation_ctx = ValidationContext::new(state.http_port_range, state.https_port_range);
+    let validation_errors = validation_ctx.validate_snapshot(&snapshot);
+
+    let mut errors: Vec<String> = validation_errors.iter().map(|e| e.description()).collect();
+
+    // 添加业务逻辑验证
+    validate_snapshot_business_rules(&snapshot, &mut errors);
+
     if !errors.is_empty() {
         return Err(GatewayError::validation(errors.join("; ")));
     }
@@ -807,7 +788,7 @@ async fn rollback_config(
         let version = config_versions::Entity::find_by_id(version_id)
             .one(txn)
             .await?
-            .ok_or_else(|| GatewayError::NotFound("config version not found".to_string()))?;
+            .ok_or_else(|| GatewayError::not_found("config version not found"))?;
 
         config_versions::Entity::update_many()
             .col_expr(config_versions::Column::Status, Expr::value("archived"))
@@ -849,7 +830,7 @@ async fn get_version(
     let version = config_versions::Entity::find_by_id(id)
         .one(&state.db)
         .await?
-        .ok_or_else(|| GatewayError::NotFound("config version not found".to_string()))?;
+        .ok_or_else(|| GatewayError::not_found("config version not found"))?;
     Ok(Json(version))
 }
 
@@ -869,7 +850,7 @@ async fn get_published_snapshot(
                 snapshot,
             }))
         }
-        None => Err(GatewayError::NotFound("no published config".to_string())),
+        None => Err(GatewayError::not_found("no published config")),
     }
 }
 
@@ -910,7 +891,7 @@ async fn heartbeat_node(
         .filter(node_status::Column::NodeId.eq(&payload.node_id))
         .one(&state.db)
         .await?
-        .ok_or_else(|| GatewayError::NotFound("node not found".to_string()))?;
+        .ok_or_else(|| GatewayError::not_found("node not found"))?;
 
     let mut active: node_status::ActiveModel = node.into();
     active.version_id = Set(payload.version_id);
@@ -970,7 +951,7 @@ async fn get_acme_challenge(
 ) -> Result<Json<JsonValue>> {
     match state.acme_store.get(&token).await {
         Some(key_auth) => Ok(Json(json!({"key_auth": key_auth}))),
-        None => Err(GatewayError::NotFound("challenge not found".to_string())),
+        None => Err(GatewayError::not_found("challenge not found")),
     }
 }
 
@@ -1008,24 +989,13 @@ fn spawn_audit(db: sea_orm::DatabaseConnection, actor: String, action: String, d
 }
 
 fn actor_from_headers(headers: &HeaderMap) -> String {
-    let raw = headers
+    headers
         .get("x-actor")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty());
-
-    match raw {
-        Some(value) => {
-            let decoded = decode_percent(value).unwrap_or_else(|| value.to_string());
-            let trimmed = decoded.trim();
-            if trimmed.is_empty() {
-                "unknown".to_string()
-            } else {
-                trimmed.to_string()
-            }
-        }
-        None => "unknown".to_string(),
-    }
+        .map(|s| decode_percent(s).unwrap_or_else(|| s.to_string()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn decode_percent(input: &str) -> Option<String> {
@@ -1058,22 +1028,16 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn validate_snapshot(
-    snapshot: &Snapshot,
-    errors: &mut Vec<String>,
-    http_port_range: Option<gateway_common::config::PortRange>,
-    https_port_range: Option<gateway_common::config::PortRange>,
-) {
-    if let (Some(http), Some(https)) = (http_port_range, https_port_range) {
-        let overlap = http.start.max(https.start) <= http.end.min(https.end);
-        if overlap {
-            errors.push(format!(
-                "HTTP_PORT_RANGE {}-{} overlaps HTTPS_PORT_RANGE {}-{}",
-                http.start, http.end, https.start, https.end
-            ));
-        }
-    }
-
+/// 验证快照的业务逻辑规则
+///
+/// 此函数专注于验证业务逻辑约束，如：
+/// - 监听器 TLS 策略配置
+/// - 上游池的健康检查配置
+/// - 路由配置的有效性和冲突
+/// - TLS 策略的有效性
+///
+/// 端口范围验证由 ValidationContext 处理
+fn validate_snapshot_business_rules(snapshot: &Snapshot, errors: &mut Vec<String>) {
     let listener_ids: HashSet<Uuid> = snapshot.listeners.iter().map(|l| l.id).collect();
     let enabled_listener_ids: HashSet<Uuid> = snapshot
         .listeners
@@ -1084,79 +1048,32 @@ fn validate_snapshot(
     let pool_ids: HashSet<Uuid> = snapshot.upstream_pools.iter().map(|p| p.id).collect();
     let tls_ids: HashSet<Uuid> = snapshot.tls_policies.iter().map(|p| p.id).collect();
 
-    let mut protocol_ports = HashSet::new();
-    let mut bind_ports = HashSet::new();
+    // 验证监听器配置
     for listener in &snapshot.listeners {
-        let key = format!("{}:{}", listener.protocol, listener.port);
-        if !protocol_ports.insert(key.clone()) {
-            errors.push(format!("duplicate listener {}", key));
-        }
         if listener.enabled {
-            if !(1..=65535).contains(&listener.port) {
-                errors.push(format!(
-                    "listener {} invalid port {}",
-                    listener.id, listener.port
-                ));
-            } else {
-                let port = listener.port as u16;
-                if !bind_ports.insert(port) {
-                    errors.push(format!("duplicate port {}", port));
-                }
-                if listener.protocol.eq_ignore_ascii_case("https") {
-                    if let Some(range) = https_port_range
-                        && !range.contains(port)
-                    {
-                        errors.push(format!(
-                            "listener {} https port {} outside HTTPS_PORT_RANGE",
-                            listener.id, port
-                        ));
-                    }
-                    if let Some(range) = http_port_range
-                        && range.contains(port)
-                    {
-                        errors.push(format!(
-                            "listener {} https port {} conflicts with HTTP_PORT_RANGE",
-                            listener.id, port
-                        ));
-                    }
-                } else {
-                    if let Some(range) = http_port_range
-                        && !range.contains(port)
-                    {
-                        errors.push(format!(
-                            "listener {} http port {} outside HTTP_PORT_RANGE",
-                            listener.id, port
-                        ));
-                    }
-                    if let Some(range) = https_port_range
-                        && range.contains(port)
-                    {
-                        errors.push(format!(
-                            "listener {} http port {} conflicts with HTTPS_PORT_RANGE",
-                            listener.id, port
-                        ));
-                    }
-                }
-            }
-
             validate_listener(listener, &tls_ids, errors);
         }
     }
 
+    // 验证上游池
     for pool in &snapshot.upstream_pools {
         validate_upstream_pool(pool, errors);
     }
 
+    // 验证上游目标
     for target in &snapshot.upstream_targets {
         validate_upstream_target(target, &pool_ids, errors);
     }
 
+    // 验证 TLS 策略
     for policy in &snapshot.tls_policies {
         validate_tls_policy(policy, errors);
     }
 
+    // 验证路由冲突
     validate_route_conflicts(&snapshot.routes, errors);
 
+    // 验证每个路由
     for route in &snapshot.routes {
         validate_route(
             route,

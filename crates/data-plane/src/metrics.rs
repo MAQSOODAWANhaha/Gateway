@@ -101,8 +101,7 @@ pub fn inc_upstream_error(reason: &str) {
 
 pub fn set_target_health(pool_id: &str, address: &str, healthy: bool) {
     if let Ok(gauge) = upstream_target_healthy() {
-        gauge
-            .with_label_values(&[pool_id, address])
-            .set(if healthy { 1 } else { 0 });
+        let value = if healthy { 1 } else { 0 };
+        gauge.with_label_values(&[pool_id, address]).set(value);
     }
 }
